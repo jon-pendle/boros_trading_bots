@@ -10,6 +10,30 @@ class PricingEngine:
         return math.floor(rate / tick_step)
 
     @staticmethod
+    def calculate_im_per_token(rate: float, k_im: float, t_thresh_seconds: float,
+                               i_tick_thresh: int, tick_step: int,
+                               margin_floor: float,
+                               time_to_maturity_seconds: float) -> float:
+        """
+        Boros Initial Margin per token.
+
+        Formula: IM = |Size| × max(|Rate|, RateFloor) × kIM × max(TTM_y, tThresh_y)
+        where RateFloor = 1.00005^(iTickThresh × tickStep) - 1
+              TTM_y = time_to_maturity / 31536000
+              tThresh_y = tThresh / 31536000
+
+        Returns IM per 1 token (in base asset units).
+        Multiply by spot_price to get USD-equivalent.
+        """
+        SECONDS_PER_YEAR = 31_536_000
+        rate_floor = 1.00005 ** (i_tick_thresh * tick_step) - 1
+        rate_factor = max(abs(rate), rate_floor)
+        ttm_years = max(time_to_maturity_seconds / SECONDS_PER_YEAR,
+                        t_thresh_seconds / SECONDS_PER_YEAR)
+        im_per_token = rate_factor * k_im * ttm_years
+        return max(im_per_token, margin_floor)
+
+    @staticmethod
     def calculate_limit_tick(side: int, best_bid: float, best_ask: float,
                              tick_step: float, slippage: float = 0.05) -> int:
         """

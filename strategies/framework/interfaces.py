@@ -56,6 +56,25 @@ class IExecutor(ABC):
         """Closes an active position. Returns trade details or None on failure."""
         pass
 
+    def submit_dual_order(self, mkt_a: int, side_a: int, mkt_b: int, side_b: int,
+                          size_tokens: float, limit_tick_a: Optional[float] = None,
+                          limit_tick_b: Optional[float] = None,
+                          round_id: Optional[str] = None) -> bool:
+        """Atomic dual-market order. Default: submit two separate orders."""
+        ok_a = self.submit_order(mkt_a, side_a, size_tokens, limit_tick_a, round_id)
+        ok_b = self.submit_order(mkt_b, side_b, size_tokens, limit_tick_b, round_id)
+        return ok_a and ok_b
+
+    def close_dual_position(self, mkt_a: int, side_a: int, tokens_a: float,
+                            mkt_b: int, side_b: int, tokens_b: float,
+                            round_id: Optional[str] = None) -> Optional[dict]:
+        """Atomic dual close. Default: close two separate positions."""
+        r_a = self.close_position(mkt_a, side_a, tokens=tokens_a, round_id=round_id)
+        r_b = self.close_position(mkt_b, side_b, tokens=tokens_b, round_id=round_id)
+        if r_a and r_b:
+            return {"market_a": mkt_a, "market_b": mkt_b, "status": "ok"}
+        return None
+
 
 class IStateManager(ABC):
     """Abstract interface for position state persistence."""

@@ -1,45 +1,48 @@
-"""Tests for VShapeStrategy - mock context, test entry/exit/hold logic."""
+"""Tests for FRArbitrageStrategy - mock context, test entry/exit/hold logic."""
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
-from strategies.v_shape.strategy import VShapeStrategy
-from strategies.v_shape import config
-from strategies.framework.interfaces import IContext, IDataProvider, IExecutor
+from strategies.fr_arb.strategy import FRArbitrageStrategy
+from strategies.fr_arb import config as fr_config
+from strategies.framework.interfaces import IContext, IExecutor
 from strategies.framework.state_manager import InMemoryStateManager
-from strategies.framework.data_provider import BorosDataProvider
-from tests.conftest import MARKET_23, MARKET_24, ORDERBOOK_23_RAW, ORDERBOOK_24_RAW
 
-# Deep orderbook for entry tests (enough USD depth at these rates)
-DEEP_OB = {
-    "long": {
-        "ia": [40, 35, 30, 25, 20],
-        "sz": [str(int(50000 * 1e18))] * 5,
-    },
-    "short": {
-        "ia": [50, 55, 60, 65, 70],
-        "sz": [str(int(50000 * 1e18))] * 5,
-    },
-}
 
-# Market with higher rates so USD depth is sufficient
-MARKET_DEEP = {
-    "marketId": 24,
+# Two markets forming a pair: A has higher rates, B has lower rates
+# Using spot_price=100 so token_value (0.08*100=8) allows sufficient capacity
+MARKET_A = {
+    "marketId": 60,
     "imData": {
-        "name": "Test ETH Market",
-        "symbol": "TEST-ETH",
+        "name": "Test Market A",
+        "symbol": "TEST-A",
         "maturity": 1774569600,
         "tickStep": 2,
     },
-    "config": {},
-    "metadata": {"platformName": "Test"},
-    "data": {
-        "markApr": 0.04,
-        "bestBid": 0.04,
-        "bestAsk": 0.05,
-        "assetMarkPrice": 2000.0,
-        "floatingApr": -0.07,
-    },
+    "data": {"assetMarkPrice": 100.0, "markApr": 0.08, "bestBid": 0.08, "bestAsk": 0.085},
 }
+
+MARKET_B = {
+    "marketId": 61,
+    "imData": {
+        "name": "Test Market B",
+        "symbol": "TEST-B",
+        "maturity": 1774569600,
+        "tickStep": 2,
+    },
+    "data": {"assetMarkPrice": 100.0, "markApr": 0.03, "bestBid": 0.03, "bestAsk": 0.035},
+}
+
+# Orderbooks with sufficient depth
+OB_A = {
+    "bids": [(0.08, 500.0), (0.075, 500.0), (0.07, 500.0)],
+    "asks": [(0.085, 500.0), (0.09, 500.0), (0.095, 500.0)],
+}
+OB_B = {
+    "bids": [(0.03, 500.0), (0.025, 500.0), (0.02, 500.0)],
+    "asks": [(0.035, 500.0), (0.04, 500.0), (0.045, 500.0)],
+}
+
+TEST_PAIR = {"TEST_60_61": (60, 61)}
 
 
 def make_context(now=None):
@@ -48,221 +51,419 @@ def make_context(now=None):
     ctx.state = InMemoryStateManager()
     ctx.executor = MagicMock(spec=IExecutor)
     ctx.executor.submit_order.return_value = True
+    ctx.executor.submit_dual_order.return_value = True
     ctx.executor.close_position.return_value = {"status": "dry_run"}
-    # Don't use spec= here because strategy uses BorosDataProvider helpers
-    # (get_market_name, etc.) that extend beyond the IDataProvider interface
+    ctx.executor.close_dual_position.return_value = {"status": "dry_run"}
     ctx.data = MagicMock()
     return ctx
 
 
-def setup_single_market(ctx, market_id, market_info, ob_raw, funding_rate):
-    """Wire mock data provider for one market."""
-    ctx.data.get_all_market_ids.return_value = [market_id]
-    ctx.data.get_market_name.side_effect = lambda mid: market_info.get('imData', {}).get('name', str(mid))
-    ctx.data.get_market_info.side_effect = lambda mid: market_info if mid == market_id else {}
-    ctx.data.get_oracle_funding_rate.side_effect = lambda mid: funding_rate if mid == market_id else 0.0
-    ctx.data.get_spot_price.side_effect = lambda mid: float(
-        market_info.get('data', {}).get('assetMarkPrice', 1.0)
-    ) if mid == market_id else 1.0
+def setup_pair(ctx, ob_a=None, ob_b=None, pairs=None):
+    """Configure mock data for a pair of markets."""
+    ob_a = ob_a or OB_A
+    ob_b = ob_b or OB_B
+    pairs = pairs or TEST_PAIR
 
-    bids = BorosDataProvider._parse_ob_side(ob_raw.get('long', {}), 0.001)
-    asks = BorosDataProvider._parse_ob_side(ob_raw.get('short', {}), 0.001)
-    bids.sort(key=lambda x: x[0], reverse=True)
-    asks.sort(key=lambda x: x[0])
-    ctx.data.get_orderbook.side_effect = lambda mid, **kw: {'bids': bids, 'asks': asks}
+    def get_market_info(mid):
+        return {60: MARKET_A, 61: MARKET_B}.get(mid, {})
+
+    def get_orderbook(mid, **kw):
+        return {60: ob_a, 61: ob_b}.get(mid, {"bids": [], "asks": []})
+
+    def get_spot_price(mid):
+        info = get_market_info(mid)
+        return float(info.get("data", {}).get("assetMarkPrice", 1.0))
+
+    ctx.data.get_market_info.side_effect = get_market_info
+    ctx.data.get_orderbook.side_effect = get_orderbook
+    ctx.data.get_spot_price.side_effect = get_spot_price
+    ctx.data.generate_pairs.return_value = pairs
+    ctx.data.get_market_name = MagicMock(side_effect=lambda mid: get_market_info(mid).get("imData", {}).get("name", str(mid)))
 
 
-class TestEntrySignal:
-    def test_entry_when_funding_below_threshold(self):
+class TestEntry:
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.042)
+    def test_entry_when_spread_above_threshold(self):
+        """Bid_A(0.08) - Ask_B(0.035) = 0.045 > 0.042 threshold -> entry."""
         ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_DEEP, DEEP_OB, funding_rate=-0.08)
+        setup_pair(ctx)
 
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         events = strat.on_tick(ctx)
 
-        entries = [e for e in events if e['type'] == 'entry']
+        entries = [e for e in events if e["type"] == "entry"]
         assert len(entries) == 1
-        assert entries[0]['market_id'] == 24
-        assert entries[0]['funding_rate'] == -0.08
-        ctx.executor.submit_order.assert_called_once()
+        assert entries[0]["pair"] == "TEST_60_61"
+        assert entries[0]["scenario"] == 1  # Short A, Long B
+        assert entries[0]["spread"] > 0.042
+        ctx.executor.submit_dual_order.assert_called_once()
 
-    def test_no_entry_when_funding_above_threshold(self):
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.10)
+    def test_no_entry_when_spread_below_threshold(self):
+        """Spread 0.045 < 0.10 threshold -> no entry."""
         ctx = make_context()
-        setup_single_market(ctx, 23, MARKET_23, ORDERBOOK_23_RAW, funding_rate=0.01)
+        setup_pair(ctx)
 
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         events = strat.on_tick(ctx)
 
-        entries = [e for e in events if e['type'] == 'entry']
+        entries = [e for e in events if e["type"] == "entry"]
         assert len(entries) == 0
-        ctx.executor.submit_order.assert_not_called()
+        ctx.executor.submit_dual_order.assert_not_called()
 
-    def test_no_entry_at_exact_threshold(self):
-        ctx = make_context()
-        setup_single_market(ctx, 23, MARKET_23, ORDERBOOK_23_RAW,
-                            funding_rate=config.ENTRY_THRESHOLD)
-
-        strat = VShapeStrategy()
-        events = strat.on_tick(ctx)
-        entries = [e for e in events if e['type'] == 'entry']
-        assert len(entries) == 0
-
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.042)
     def test_state_persisted_after_entry(self):
         ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_DEEP, DEEP_OB, funding_rate=-0.08)
+        setup_pair(ctx)
 
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         strat.on_tick(ctx)
 
-        pos = ctx.state.get_position("v_shape", 24)
-        assert pos is not None
-        assert pos['entry_rate'] == -0.08
-        assert pos['position_size'] > 0
-        assert pos['tokens'] > 0
+        pos_A = ctx.state.get_position("fr_arb", 60)
+        pos_B = ctx.state.get_position("fr_arb", 61)
+        assert pos_A is not None
+        assert pos_B is not None
+        assert pos_A["side"] == 1  # Short A
+        assert pos_B["side"] == 0  # Long B
+        assert pos_A["tokens"] > 0
+        assert pos_A["round_id"] == pos_B["round_id"]
 
-    def test_max_positions_cap(self):
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.042)
+    def test_no_entry_when_orderbook_empty(self):
         ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_24, ORDERBOOK_24_RAW, funding_rate=-0.08)
+        setup_pair(ctx, ob_a={"bids": [], "asks": []})
 
-        # Pre-fill state with MAX_POSITIONS positions
-        for i in range(config.MAX_POSITIONS):
-            ctx.state.set_position("v_shape", 100 + i, {
-                "entry_time": ctx.now.isoformat(), "entry_rate": -0.1,
-                "position_size": 1000, "tokens": 10,
-            })
-
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         events = strat.on_tick(ctx)
 
-        entries = [e for e in events if e['type'] == 'entry']
-        skips = [e for e in events if e['type'] == 'skip' and e.get('reason') == 'max_positions']
+        entries = [e for e in events if e["type"] == "entry"]
+        assert len(entries) == 0
+
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.042)
+    def test_exec_fail_when_dual_order_rejected(self):
+        ctx = make_context()
+        setup_pair(ctx)
+        # Atomic dual order fails
+        ctx.executor.submit_dual_order.return_value = False
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        entries = [e for e in events if e["type"] == "entry"]
+        assert len(entries) == 0
+        fails = [e for e in events if e["type"] == "exec_fail"]
+        assert len(fails) == 1
+        assert fails[0]["reason"] == "dual_entry_failed"
+
+
+class TestExit:
+    def _setup_positions(self, ctx, hours_ago=5):
+        entry_time = ctx.now - timedelta(hours=hours_ago)
+        round_id = "test_round"
+        ctx.state.set_position("fr_arb", 60, {
+            "entry_time": entry_time.isoformat(),
+            "side": 1,  # Short A
+            "position_size": 5000.0,
+            "tokens": 100.0,
+            "round_id": round_id,
+        })
+        ctx.state.set_position("fr_arb", 61, {
+            "entry_time": entry_time.isoformat(),
+            "side": 0,  # Long B
+            "position_size": 3500.0,
+            "tokens": 100.0,
+            "round_id": round_id,
+        })
+
+    @patch.object(fr_config, "EXIT_SPREAD_THRESHOLD", 0.038)
+    @patch.object(fr_config, "MIN_HOLD_HOURS", 1.0)
+    def test_exit_when_spread_narrows(self):
+        """Close spread = ask_A(0.085) - bid_B(0.03) = 0.055 > 0.038, no exit.
+        Override OB so spread narrows below threshold."""
+        ctx = make_context()
+        # Narrowed spread: ask_A=0.06, bid_B=0.03 -> spread=0.03 < 0.038
+        narrow_ob_a = {
+            "bids": [(0.055, 500.0)],
+            "asks": [(0.06, 500.0)],
+        }
+        setup_pair(ctx, ob_a=narrow_ob_a)
+        self._setup_positions(ctx, hours_ago=5)
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        exits = [e for e in events if e["type"] == "exit"]
+        assert len(exits) == 1
+        ctx.executor.close_dual_position.assert_called_once()
+        assert ctx.state.get_position("fr_arb", 60) is None
+        assert ctx.state.get_position("fr_arb", 61) is None
+
+    @patch.object(fr_config, "EXIT_SPREAD_THRESHOLD", 0.038)
+    @patch.object(fr_config, "MIN_HOLD_HOURS", 10.0)
+    def test_hold_when_min_hold_not_met(self):
+        """Spread narrowed but held only 5h < 10h min -> hold."""
+        ctx = make_context()
+        narrow_ob_a = {"bids": [(0.055, 500.0)], "asks": [(0.06, 500.0)]}
+        setup_pair(ctx, ob_a=narrow_ob_a)
+        self._setup_positions(ctx, hours_ago=5)
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        holds = [e for e in events if e["type"] == "hold"]
+        exits = [e for e in events if e["type"] == "exit"]
+        assert len(holds) == 1
+        assert len(exits) == 0
+
+    @patch.object(fr_config, "EXIT_SPREAD_THRESHOLD", 0.038)
+    @patch.object(fr_config, "MIN_HOLD_HOURS", 1.0)
+    def test_hold_when_spread_still_wide(self):
+        """Spread still wide (0.045 > 0.038) -> hold."""
+        ctx = make_context()
+        setup_pair(ctx)  # Default OBs have wide spread
+        self._setup_positions(ctx, hours_ago=5)
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        holds = [e for e in events if e["type"] == "hold"]
+        exits = [e for e in events if e["type"] == "exit"]
+        assert len(holds) == 1
+        assert len(exits) == 0
+
+
+class TestOrphanAutoClose:
+    def _setup_one_leg(self, ctx, market_id=60, side=1, hours_ago=5):
+        """Set up only one leg of a pair in state."""
+        entry_time = ctx.now - timedelta(hours=hours_ago)
+        ctx.state.set_position("fr_arb", market_id, {
+            "entry_time": entry_time.isoformat(),
+            "side": side,
+            "position_size": 5000.0,
+            "tokens": 100.0,
+            "round_id": "orphan_round",
+        })
+
+    def test_orphan_auto_closes(self):
+        """Only one leg in state → auto-close via close_position."""
+        ctx = make_context()
+        setup_pair(ctx)
+        self._setup_one_leg(ctx, market_id=60, side=1)
+        ctx.executor.close_position.return_value = {"status": "dry_run"}
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        exits = [e for e in events if e["type"] == "exit"]
+        assert len(exits) == 1
+        assert exits[0]["reason"] == "orphan_auto_close"
+        ctx.executor.close_position.assert_called_once()
+        # State should be cleared
+        assert ctx.state.get_position("fr_arb", 60) is None
+
+    def test_orphan_close_failure_retries(self):
+        """Orphan close fails → exec_fail event, state NOT cleared (retry next tick)."""
+        ctx = make_context()
+        setup_pair(ctx)
+        self._setup_one_leg(ctx, market_id=60, side=1)
+        ctx.executor.close_position.return_value = None  # close fails
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        fails = [e for e in events if e["type"] == "exec_fail"]
+        assert len(fails) == 1
+        assert fails[0]["reason"] == "orphan_close_failed"
+        # State should NOT be cleared — will retry next tick
+        assert ctx.state.get_position("fr_arb", 60) is not None
+
+    def test_orphan_other_leg(self):
+        """Only leg B in state (leg A missing) → auto-close leg B."""
+        ctx = make_context()
+        setup_pair(ctx)
+        self._setup_one_leg(ctx, market_id=61, side=0)
+        ctx.executor.close_position.return_value = {"status": "dry_run"}
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        exits = [e for e in events if e["type"] == "exit"]
+        assert len(exits) == 1
+        assert exits[0]["reason"] == "orphan_auto_close"
+        assert ctx.state.get_position("fr_arb", 61) is None
+
+
+class TestMultiPairOrphan:
+    """Market 60 appears in two pairs: 60_61 (active) and 60_62.
+    Market 60 should NOT be treated as orphan in pair 60_62."""
+
+    MARKET_C = {
+        "marketId": 62,
+        "imData": {"name": "Test Market C", "symbol": "TEST-C",
+                   "maturity": 1774569600, "tickStep": 2},
+        "data": {"assetMarkPrice": 100.0, "markApr": 0.02,
+                 "bestBid": 0.02, "bestAsk": 0.025},
+    }
+
+    OB_C = {
+        "bids": [(0.02, 500.0)],
+        "asks": [(0.025, 500.0)],
+    }
+
+    def _setup_active_pair(self, ctx):
+        """Market 60 (SHORT) + 61 (LONG) with shared round_id."""
+        entry_time = ctx.now - timedelta(hours=5)
+        rid = "active_round_60_61"
+        ctx.state.set_position("fr_arb", 60, {
+            "entry_time": entry_time.isoformat(),
+            "side": 1, "position_size": 5000.0,
+            "tokens": 100.0, "round_id": rid,
+        })
+        ctx.state.set_position("fr_arb", 61, {
+            "entry_time": entry_time.isoformat(),
+            "side": 0, "position_size": 3500.0,
+            "tokens": 100.0, "round_id": rid,
+        })
+
+    def test_not_orphan_when_paired_in_other_combo(self):
+        """Market 60 is in pair 60_61 (active). In pair 60_62 it should
+        NOT be treated as orphan — it has a partner (61) via dynamic pair check."""
+        ctx = make_context()
+
+        # Two pairs share market 60
+        two_pairs = {"TEST_60_61": (60, 61), "TEST_60_62": (60, 62)}
+
+        markets = {60: MARKET_A, 61: MARKET_B, 62: self.MARKET_C}
+        obs = {60: OB_A, 61: OB_B, 62: self.OB_C}
+
+        ctx.data.get_market_info.side_effect = lambda mid: markets.get(mid, {})
+        ctx.data.get_orderbook.side_effect = lambda mid, **kw: obs.get(mid, {"bids": [], "asks": []})
+        ctx.data.get_spot_price.side_effect = lambda mid: float(markets.get(mid, {}).get("data", {}).get("assetMarkPrice", 1.0))
+        ctx.data.generate_pairs.return_value = two_pairs
+        ctx.data.get_all_market_ids.return_value = [60, 61, 62]
+
+        self._setup_active_pair(ctx)
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        # No orphan close should happen — market 60 has partner 61
+        orphan_exits = [e for e in events if e.get("reason") == "orphan_auto_close"]
+        assert len(orphan_exits) == 0
+        ctx.executor.close_position.assert_not_called()
+
+        # Both positions still in state
+        assert ctx.state.get_position("fr_arb", 60) is not None
+        assert ctx.state.get_position("fr_arb", 61) is not None
+
+
+class TestVWAPCapacity:
+    def test_calculate_vwap_basic(self):
+        liquidity = [(0.08, 10.0), (0.075, 20.0), (0.07, 30.0)]
+        vwap = FRArbitrageStrategy._calculate_vwap(liquidity, 15.0)
+        # 10 @ 0.08 + 5 @ 0.075 = 0.8 + 0.375 = 1.175 / 15 = 0.0783
+        assert vwap == pytest.approx(1.175 / 15.0)
+
+    def test_calculate_vwap_exact_fill(self):
+        liquidity = [(0.08, 10.0)]
+        vwap = FRArbitrageStrategy._calculate_vwap(liquidity, 10.0)
+        assert vwap == pytest.approx(0.08)
+
+    def test_calculate_vwap_book_exhausted(self):
+        liquidity = [(0.08, 5.0)]
+        vwap = FRArbitrageStrategy._calculate_vwap(liquidity, 10.0)
+        assert vwap is None
+
+    def test_calculate_vwap_empty(self):
+        vwap = FRArbitrageStrategy._calculate_vwap([], 10.0)
+        assert vwap is None
+
+
+class TestMarginPreCheck:
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.042)
+    @patch.object(fr_config, "USER_ADDRESS", "0xTestUser")
+    def test_skip_when_insufficient_margin(self):
+        """Spread qualifies but margin is too low -> skip with insufficient_margin."""
+        ctx = make_context()
+        setup_pair(ctx)
+
+        # Mock collateral detail returning near-zero balance, no positions
+        ctx.data.get_collateral_detail = MagicMock(return_value={
+            3: {"available": 0.001, "positions": []},
+        })
+
+        # Add config fields to market info for IM calculation
+        market_a = dict(MARKET_A)
+        market_a['config'] = {
+            'kIM': '909090909090909090',  # 0.9091
+            'tThresh': 604800,
+        }
+        market_a['tokenId'] = 3
+        market_b = dict(MARKET_B)
+        market_b['config'] = {
+            'kIM': '909090909090909090',
+            'tThresh': 604800,
+        }
+        market_b['tokenId'] = 3
+
+        orig_get_market_info = ctx.data.get_market_info.side_effect
+
+        def get_market_info_with_config(mid):
+            if mid == 60:
+                return market_a
+            elif mid == 61:
+                return market_b
+            return orig_get_market_info(mid)
+
+        ctx.data.get_market_info.side_effect = get_market_info_with_config
+
+        strat = FRArbitrageStrategy()
+        events = strat.on_tick(ctx)
+
+        skips = [e for e in events if e["type"] == "skip"]
+        entries = [e for e in events if e["type"] == "entry"]
         assert len(entries) == 0
         assert len(skips) == 1
+        assert skips[0]["reason"] == "insufficient_margin"
 
-
-class TestExitSignal:
-    def _setup_position(self, ctx, market_id, hours_ago, entry_rate=-0.08):
-        entry_time = ctx.now - timedelta(hours=hours_ago)
-        ctx.state.set_position("v_shape", market_id, {
-            "entry_time": entry_time.isoformat(),
-            "entry_rate": entry_rate,
-            "position_size": 1000,
-            "tokens": 10.0,
-            "round_id": "test_round",
-        })
-
-    def test_exit_when_funding_recovered_and_held_enough(self):
+    @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.042)
+    @patch.object(fr_config, "USER_ADDRESS", "")
+    def test_no_margin_check_without_user_address(self):
+        """Without USER_ADDRESS, margin check is skipped and entry proceeds."""
         ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_24, ORDERBOOK_24_RAW, funding_rate=0.01)
-        self._setup_position(ctx, 24, hours_ago=15)
+        setup_pair(ctx)
 
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         events = strat.on_tick(ctx)
 
-        exits = [e for e in events if e['type'] == 'exit']
-        assert len(exits) == 1
-        assert exits[0]['market_id'] == 24
-        ctx.executor.close_position.assert_called_once()
-        assert ctx.state.get_position("v_shape", 24) is None
+        entries = [e for e in events if e["type"] == "entry"]
+        assert len(entries) == 1
 
-    def test_hold_when_funding_recovered_but_too_early(self):
+
+class TestDynamicPairs:
+    def test_pairs_generated_from_context(self):
+        """Strategy uses generate_pairs from data provider, not config."""
         ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_24, ORDERBOOK_24_RAW, funding_rate=0.01)
-        self._setup_position(ctx, 24, hours_ago=2)  # < MIN_HOLD_HOURS
+        setup_pair(ctx)
 
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         events = strat.on_tick(ctx)
 
-        holds = [e for e in events if e['type'] == 'hold']
-        exits = [e for e in events if e['type'] == 'exit']
-        assert len(holds) == 1
-        assert len(exits) == 0
-
-    def test_hold_when_funding_still_negative(self):
-        ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_24, ORDERBOOK_24_RAW, funding_rate=-0.03)
-        self._setup_position(ctx, 24, hours_ago=20)
-
-        strat = VShapeStrategy()
-        events = strat.on_tick(ctx)
-
-        holds = [e for e in events if e['type'] == 'hold']
-        exits = [e for e in events if e['type'] == 'exit']
-        assert len(holds) == 1
-        assert len(exits) == 0
-
-
-class TestDataUnavailable:
-    def test_skip_when_funding_rate_none(self):
-        ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_DEEP, DEEP_OB, funding_rate=-0.08)
-        # Override funding rate to return None (API failure)
-        ctx.data.get_oracle_funding_rate.side_effect = lambda mid: None
-
-        strat = VShapeStrategy()
-        events = strat.on_tick(ctx)
-
-        skips = [e for e in events if e['type'] == 'skip']
-        assert len(skips) == 1
-        assert skips[0]['reason'] == 'data_unavailable'
-        assert skips[0]['funding_rate'] is None
-        ctx.executor.submit_order.assert_not_called()
-
-    def test_no_exit_when_funding_rate_none_with_position(self):
-        """If funding data unavailable, hold existing position (don't exit)."""
-        ctx = make_context()
-        setup_single_market(ctx, 24, MARKET_DEEP, DEEP_OB, funding_rate=-0.08)
-        ctx.data.get_oracle_funding_rate.side_effect = lambda mid: None
-
-        from datetime import timedelta
-        entry_time = ctx.now - timedelta(hours=15)
-        ctx.state.set_position("v_shape", 24, {
-            "entry_time": entry_time.isoformat(),
-            "entry_rate": -0.08,
-            "position_size": 1000,
-            "tokens": 10.0,
-        })
-
-        strat = VShapeStrategy()
-        events = strat.on_tick(ctx)
-
-        # Should skip, not exit
-        exits = [e for e in events if e['type'] == 'exit']
-        skips = [e for e in events if e['type'] == 'skip']
-        assert len(exits) == 0
-        assert len(skips) == 1
-        assert skips[0]['reason'] == 'data_unavailable'
-        # Position should still exist
-        assert ctx.state.get_position("v_shape", 24) is not None
-
-
-class TestEventTypes:
-    def test_scan_events_for_all_markets(self):
-        ctx = make_context()
-        setup_single_market(ctx, 23, MARKET_23, ORDERBOOK_23_RAW, funding_rate=0.01)
-
-        strat = VShapeStrategy()
-        events = strat.on_tick(ctx)
-
-        scans = [e for e in events if e['type'] == 'scan']
+        ctx.data.generate_pairs.assert_called_once()
+        scans = [e for e in events if e["type"] == "scan"]
         assert len(scans) == 1
-        assert scans[0]['market_id'] == 23
-        assert 'funding_rate' in scans[0]
-        assert 'spot_price' in scans[0]
-        assert 'best_bid' in scans[0]
+        assert scans[0]["pair"] == "TEST_60_61"
 
-    def test_skip_event_has_reason(self):
+    def test_empty_pairs_no_crash(self):
+        """No pairs generated -> no scan/entry/exit events, no crash."""
         ctx = make_context()
-        # Tiny orderbook -> insufficient depth
-        tiny_ob = {
-            "long": {"ia": [1], "sz": ["1000000000000"]},  # tiny
-            "short": {"ia": [2], "sz": ["1000000000000"]},
-        }
-        setup_single_market(ctx, 24, MARKET_24, tiny_ob, funding_rate=-0.08)
+        ctx.data = MagicMock()
+        ctx.data.generate_pairs.return_value = {}
 
-        strat = VShapeStrategy()
+        strat = FRArbitrageStrategy()
         events = strat.on_tick(ctx)
 
-        skips = [e for e in events if e['type'] == 'skip']
-        assert len(skips) == 1
-        assert skips[0]['reason'] == 'insufficient_depth'
+        scans = [e for e in events if e["type"] == "scan"]
+        entries = [e for e in events if e["type"] == "entry"]
+        assert len(scans) == 0
+        assert len(entries) == 0

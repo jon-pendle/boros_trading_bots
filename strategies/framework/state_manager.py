@@ -1,12 +1,18 @@
 """
 State managers for position persistence.
 - InMemoryStateManager: volatile, for testing
-- JsonFileStateManager: persists to disk, survives restarts
+- JsonFileStateManager: persists to disk, survives restarts (sim mode)
+- ApiStateManager: recovers state from Boros API on startup (prod mode)
 """
 import json
+import logging
 import os
+import requests
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from .interfaces import IStateManager
+
+logger = logging.getLogger(__name__)
 
 
 class InMemoryStateManager(IStateManager):
@@ -79,3 +85,118 @@ class JsonFileStateManager(IStateManager):
         key = f"{strategy_name}_{market_id}"
         if self._positions.pop(key, None) is not None:
             self._save()
+
+
+class ApiStateManager(InMemoryStateManager):
+    """
+    Prod state manager: recovers positions from Boros API on startup,
+    then keeps state in memory with entry_time persisted to disk.
+
+    Uses GET /v1/collaterals/summary to find existing positions.
+    Entry times are saved to a small JSON file so holding hours survive restarts.
+    """
+
+    ENTRY_TIMES_FILE = "entry_times.json"
+
+    MAX_RETRIES = 3
+    RETRY_BACKOFF = 2.0  # seconds: 2, 4, 8
+
+    def __init__(self, api_base_url: str, user_address: str, account_id: int = 0,
+                 timeout: int = 10):
+        super().__init__()
+        self.api_base_url = api_base_url.rstrip('/')
+        self.user_address = user_address
+        self.account_id = account_id
+        self.timeout = timeout
+        self._entry_times = self._load_entry_times()
+
+    def _api_get_with_retry(self, url: str, params: dict = None) -> Optional[dict]:
+        """GET with retry + exponential backoff for transient failures."""
+        import time as _time
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                resp = requests.get(url, params=params, timeout=self.timeout)
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    logger.warning("GET %s -> HTTP %d (attempt %d/%d)",
+                                   url, resp.status_code, attempt + 1, self.MAX_RETRIES)
+                else:
+                    logger.error("GET %s -> HTTP %d (not retrying)", url, resp.status_code)
+                    return None
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                logger.warning("GET %s -> %s (attempt %d/%d)",
+                               url, type(e).__name__, attempt + 1, self.MAX_RETRIES)
+            except Exception as e:
+                logger.error("GET %s unexpected error: %s", url, e)
+                return None
+            if attempt < self.MAX_RETRIES - 1:
+                _time.sleep(self.RETRY_BACKOFF * (2 ** attempt))
+        logger.error("GET %s failed after %d retries", url, self.MAX_RETRIES)
+        return None
+
+    def _load_entry_times(self) -> dict:
+        if os.path.exists(self.ENTRY_TIMES_FILE):
+            try:
+                with open(self.ENTRY_TIMES_FILE, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {}
+
+    def _save_entry_times(self):
+        with open(self.ENTRY_TIMES_FILE, 'w') as f:
+            json.dump(self._entry_times, f, indent=2)
+
+    def set_position(self, strategy_name: str, market_id: int, data: Dict[str, Any]):
+        """Save position and persist entry_time."""
+        super().set_position(strategy_name, market_id, data)
+        key = f"{strategy_name}_{market_id}"
+        entry_time = data.get("entry_time")
+        if entry_time and entry_time != "recovered":
+            self._entry_times[key] = entry_time
+            self._save_entry_times()
+
+    def clear_position(self, strategy_name: str, market_id: int):
+        """Clear position and remove persisted entry_time."""
+        super().clear_position(strategy_name, market_id)
+        key = f"{strategy_name}_{market_id}"
+        if self._entry_times.pop(key, None) is not None:
+            self._save_entry_times()
+
+    def get_entry_time(self, strategy_name: str, market_id: int) -> Optional[str]:
+        """
+        Get entry time for a position. Priority:
+          1. Persisted entry_times.json (local cache)
+          2. Trade history API /v1/pnl/transactions
+        Returns ISO timestamp string or None.
+        """
+        key = f"{strategy_name}_{market_id}"
+        entry_time = self._entry_times.get(key)
+        if entry_time:
+            return entry_time
+
+        # Look up from trade history API
+        try:
+            data = self._api_get_with_retry(
+                f"{self.api_base_url}/v1/pnl/transactions",
+                params={
+                    "userAddress": self.user_address,
+                    "accountId": self.account_id,
+                    "marketId": market_id,
+                    "limit": 50,
+                },
+            )
+            if data:
+                trades = data if isinstance(data, list) else data.get("results", [])
+                timestamps = [t.get("time", 0) for t in trades if t.get("time")]
+                if timestamps:
+                    earliest = min(timestamps)
+                    entry_time = datetime.fromtimestamp(earliest, tz=timezone.utc).isoformat()
+                    logger.info("  [%d] Entry time from trade history: %s", market_id, entry_time)
+                    self._entry_times[key] = entry_time
+                    self._save_entry_times()
+                    return entry_time
+        except Exception as e:
+            logger.warning("  [%d] Trade history lookup failed: %s", market_id, e)
+        return None

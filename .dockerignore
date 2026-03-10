@@ -1,0 +1,13 @@
+.env*
+*.json
+logs/
+tests/
+docs/
+__pycache__/
+*.pyc
+.git/
+.claude/
+*.md
+approve_agent.py
+bc_ur.py
+run_sim.py

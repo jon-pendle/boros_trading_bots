@@ -1,0 +1,28 @@
+services:
+  prod:
+    build: .
+    container_name: boros-prod
+    restart: always
+    env_file: .env.prod
+    volumes:
+      - prod-logs:/app/logs
+      - ./entry_times.json:/app/entry_times.json
+    command: ["python", "main.py", "--live"]
+    mem_limit: 180m
+
+  test:
+    build: .
+    container_name: boros-test
+    restart: "no"
+    env_file: .env.test
+    volumes:
+      - test-logs:/app/logs
+      - ./test_state.json:/app/bot_state.json
+      - ./agent_keystore.json:/app/agent_keystore.json:ro
+    command: ["python", "main.py", "--live"]
+    mem_limit: 250m
+    profiles: ["test"]
+
+volumes:
+  prod-logs:
+  test-logs:

@@ -1,16 +1,26 @@
 """
 Alert module - dispatches strategy events to notification channels.
 
-Supports IFTTT Webhooks (JSON format) for push notifications.
+Alert tiers:
+  P0 (critical):  liquidation, circuit_breaker_open  → immediate, always
+  P1 (action):    entry, exit                        → immediate, always
+  P1 (action):    exec_fail                          → throttled (1 per pair per 30min)
+  P2 (signal):    skip                               → suppressed (rolled into P3 summary)
+  P3 (periodic):  summary                            → 1 consolidated message per cycle
+  ---             scan, hold, tick_summary            → no alert (too frequent)
+
 IFTTT setup:
   1. Enable Webhooks service, create applet: IF Webhook(boros_event) THEN notification
   2. Set env: IFTTT_WEBHOOK_KEY=your_key
 """
 import logging
+import time
 import requests
-from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Throttle window for exec_fail alerts (seconds)
+EXEC_FAIL_THROTTLE_SECONDS = 1800  # 30 minutes
 
 
 class IFTTTAlert:
@@ -29,81 +39,192 @@ class IFTTTAlert:
     def webhook_url(self) -> str:
         return f"https://maker.ifttt.com/trigger/{self.event_name}/json/with/key/{self.webhook_key}"
 
-    def send(self, payload: dict) -> bool:
+    def send(self, payload: dict, retries: int = 2) -> bool:
         if not self.enabled:
             return False
-        try:
-            resp = requests.post(self.webhook_url, json=payload, timeout=self.timeout)
-            if resp.status_code == 200:
-                logger.info("IFTTT alert sent: %s", next(iter(payload.values()), ""))
-                return True
-            else:
-                logger.warning("IFTTT alert failed: HTTP %d", resp.status_code)
-        except Exception as e:
-            logger.warning("IFTTT alert error: %s", e)
+        for attempt in range(1, retries + 1):
+            try:
+                resp = requests.post(self.webhook_url, json=payload, timeout=self.timeout)
+                if resp.status_code == 200:
+                    logger.debug("IFTTT alert sent")
+                    return True
+                else:
+                    logger.warning("IFTTT alert failed: HTTP %d", resp.status_code)
+            except Exception as e:
+                logger.warning("IFTTT alert error (attempt %d/%d): %s", attempt, retries, e)
         return False
 
 
 class AlertHandler:
-    """Processes strategy events and dispatches alerts."""
+    """Processes strategy events and dispatches alerts by priority tier."""
 
     def __init__(self, ifttt: IFTTTAlert):
         self.ifttt = ifttt
-        self._prolonged_alerted: set[int] = set()
+        # exec_fail throttle: {pair -> last_alert_timestamp}
+        self._exec_fail_last: dict[str, float] = {}
+        # P2 skip accumulator: collected between summary cycles
+        self._pending_skips: list[dict] = []
 
     def handle_events(self, events: list[dict]):
         for event in events:
             event_type = event.get("type")
 
-            if event_type == "entry":
+            # P0 — critical (always immediate)
+            if event_type == "liquidation":
+                self._on_liquidation(event)
+            elif event_type == "circuit_breaker":
+                self._on_circuit_breaker(event)
+            # P1 — action (always immediate)
+            elif event_type == "entry":
                 self._on_entry(event)
             elif event_type == "exit":
                 self._on_exit(event)
-                self._prolonged_alerted.discard(event.get("market_id"))
-            elif event_type == "exit_failed":
-                self._on_exit_failed(event)
-            elif event_type == "hold" and event.get("prolonged"):
-                self._on_prolonged_hold(event)
+            # P1 — exec_fail (throttled per pair)
+            elif event_type == "exec_fail":
+                self._on_exec_fail(event)
+            # P2 — skip (accumulate, send in summary)
+            elif event_type == "skip":
+                self._pending_skips.append(event)
 
-    def _fmt_market(self, e: dict) -> str:
-        return f"[{e['market_id']}] {e['symbol']}"
+    # ------------------------------------------------------------------
+    # P3 — periodic summary (1 consolidated IFTTT message)
+    # ------------------------------------------------------------------
+
+    def send_summary_alerts(self, summary: dict):
+        """Send periodic summary as a single consolidated IFTTT message."""
+        lines = []
+
+        # 1. Heartbeat
+        lines.append(
+            f"T#{summary['tick']} "
+            f"Up:{summary['uptime_hours']:.1f}h "
+            f"AvgTick:{summary['avg_tick_seconds']:.0f}s "
+            f"Pairs:{summary.get('active_pairs', 0)} "
+            f"Fails:{summary['cb_failures']}"
+        )
+
+        # 2. PnL
+        pnl = summary.get('pnl', {})
+        lines.append(
+            f"PnL u:${pnl.get('unrealized', 0):+.2f}"
+            f"({pnl.get('open_pairs', 0)}p) "
+            f"r:${pnl.get('realized', 0):+.2f}"
+            f"({pnl.get('closed_rounds', 0)}rd) "
+            f"= ${pnl.get('total', 0):+.2f}"
+        )
+
+        # 3. Collateral (compact)
+        collaterals = summary.get('collaterals', {})
+        if collaterals:
+            coll_parts = []
+            for name, info in collaterals.items():
+                n_pos = len(info.get('positions', []))
+                mr = info.get('margin_ratio', 0)
+                mr_str = f" MR:{mr:.0%}" if mr > 0 else ""
+                coll_parts.append(
+                    f"{name}:{info['available']:.2f}/{info.get('net_balance', 0):.2f}"
+                    f" IM:{info.get('initial_margin', 0):.2f}{mr_str} {n_pos}pos"
+                )
+            lines.append("Coll " + " | ".join(coll_parts))
+
+        # 4. Top spreads (top 3)
+        top_spreads = summary.get('top_spreads', [])
+        if top_spreads:
+            sp_parts = [f"{s['pair']}:{s['spread']:.2f}%" for s in top_spreads[:3]]
+            lines.append("Spread " + " | ".join(sp_parts))
+
+        # 5. Session stats
+        stats = summary.get('stats', {})
+        if stats:
+            skip_parts = [f"{c}x{r}" for r, c in stats.get('skips', {}).items()]
+            lines.append(
+                f"Stats E:{stats.get('entries', 0)} X:{stats.get('exits', 0)} "
+                f"Skip:{','.join(skip_parts) if skip_parts else '0'} "
+                f"MaxSp:{stats.get('max_spread', 0) * 100:.2f}%"
+            )
+
+        # 6. Accumulated P2 skips since last summary
+        if self._pending_skips:
+            # Group by (pair, reason)
+            skip_groups: dict[str, int] = {}
+            for s in self._pending_skips:
+                key = f"{s.get('pair', '?')}:{s.get('reason', '?')}"
+                skip_groups[key] = skip_groups.get(key, 0) + 1
+            skip_strs = [f"{k}x{v}" for k, v in skip_groups.items()]
+            lines.append(f"Skips {' '.join(skip_strs)}")
+            self._pending_skips.clear()
+
+        # Send as single message
+        self.ifttt.send({"msg": f"[P3] " + "\n".join(lines)})
+
+    # ------------------------------------------------------------------
+    # P0 — critical
+    # ------------------------------------------------------------------
+
+    def _on_liquidation(self, e: dict):
+        self.ifttt.send({
+            "msg": (
+                f"[P0] LIQUIDATED [{e.get('market_id', '?')}] | "
+                f"${e.get('position_size', 0)} | "
+                f"state cleared"
+            ),
+        })
+
+    def _on_circuit_breaker(self, e: dict):
+        status = e.get('status', 'open')
+        if status == 'open':
+            self.ifttt.send({
+                "msg": (
+                    f"[P0] CB_OPEN | "
+                    f"{e.get('consecutive_failures', 0)} consecutive failures | "
+                    f"cooldown {e.get('cooldown_seconds', 0)}s"
+                ),
+            })
+        else:
+            self.ifttt.send({
+                "msg": f"[P0] CB_RECOVERED | resuming normal operation",
+            })
+
+    # ------------------------------------------------------------------
+    # P1 — action taken
+    # ------------------------------------------------------------------
 
     def _on_entry(self, e: dict):
         self.ifttt.send({
-            "entry": self._fmt_market(e),
-            "funding": f"{e['funding_rate']:+.2%}",
-            "size_usd": e["position_size"],
-            "tokens": round(e["tokens"], 4),
-            "bid_ask": f"{e.get('best_bid', 0):+.4f}/{e.get('best_ask', 0):+.4f}",
-            "spot": e.get("spot_price"),
+            "msg": (
+                f"[P1] ENTRY {e.get('pair', '?')} | "
+                f"S{e.get('scenario', '?')} spread={e.get('spread', 0):.2%} | "
+                f"{e.get('tokens', 0):.1f} tokens | "
+                f"${e.get('size_usd_a', 0):.0f}+${e.get('size_usd_b', 0):.0f}"
+            ),
         })
 
     def _on_exit(self, e: dict):
         self.ifttt.send({
-            "exit": self._fmt_market(e),
-            "funding": f"{e['funding_rate']:+.2%}",
-            "entry_rate": f"{e['entry_rate']:+.2%}",
-            "held_hours": e["duration_hours"],
-            "size_usd": e.get("position_size"),
+            "msg": (
+                f"[P1] EXIT {e.get('pair', '?')} | "
+                f"spread={e.get('current_spread', 0):.2%} | "
+                f"held {e.get('duration_hours', 0):.1f}h | "
+                f"{e.get('tokens_closed', 0):.1f} tokens | "
+                f"{e.get('reason', '')}"
+            ),
         })
 
-    def _on_exit_failed(self, e: dict):
-        self.ifttt.send({
-            "exit_failed": self._fmt_market(e),
-            "funding": f"{e['funding_rate']:+.2%}",
-            "held_hours": e["duration_hours"],
-            "note": "manual intervention needed",
-        })
-
-    def _on_prolonged_hold(self, e: dict):
-        market_id = e.get("market_id")
-        if market_id in self._prolonged_alerted:
+    def _on_exec_fail(self, e: dict):
+        """Throttled: max 1 alert per pair per 30 minutes."""
+        pair = e.get('pair', '?')
+        now = time.time()
+        last = self._exec_fail_last.get(pair, 0)
+        if now - last < EXEC_FAIL_THROTTLE_SECONDS:
+            logger.debug("exec_fail alert throttled for %s (%.0fs since last)",
+                         pair, now - last)
             return
-        self._prolonged_alerted.add(market_id)
-
+        self._exec_fail_last[pair] = now
         self.ifttt.send({
-            "prolonged_hold": self._fmt_market(e),
-            "funding": f"{e['funding_rate']:+.2%}",
-            "entry_rate": f"{e['entry_rate']:+.2%}",
-            "held_hours": e["duration_hours"],
+            "msg": (
+                f"[P1] EXEC_FAIL {pair} | "
+                f"{e.get('reason', '?')} | "
+                f"spread={e.get('spread', 0):.2%} | "
+                f"{e.get('tokens', 0):.1f} tokens"
+            ),
         })
