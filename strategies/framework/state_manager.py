@@ -189,10 +189,35 @@ class ApiStateManager(InMemoryStateManager):
             )
             if data:
                 trades = data if isinstance(data, list) else data.get("results", [])
-                timestamps = [t.get("time", 0) for t in trades if t.get("time")]
-                if timestamps:
-                    earliest = min(timestamps)
-                    entry_time = datetime.fromtimestamp(earliest, tz=timezone.utc).isoformat()
+                # Sort by time descending (newest first)
+                # tradeDirection: 0=INCREASE, 1=DECREASE, 2=CHANGE_DIRECTION
+                trades = [t for t in trades if t.get("time")]
+                trades.sort(key=lambda t: t["time"], reverse=True)
+                # Find current position's entry time.
+                # Walk from newest to oldest looking at INCREASE trades.
+                # DECREASE trades are skipped (partial close, side field
+                # is the trade direction not position direction).
+                # FLIP (tradeDirection=2) marks current position's start.
+                # Consecutive INCREASEs with the same side belong to the
+                # same position — keep the earliest one.
+                entry_ts = None
+                entry_side = None
+                for t in trades:
+                    td = t.get("tradeDirection")
+                    if td == 2:  # FLIP = current position started here
+                        entry_ts = t["time"]
+                        break
+                    if td == 1:  # DECREASE = partial/full close, skip
+                        continue
+                    if td == 0:  # INCREASE = open/add
+                        if entry_side is None:
+                            entry_side = t.get("side")
+                        if t.get("side") != entry_side:
+                            break  # different side = previous position
+                        entry_ts = t["time"]  # keep going to find earliest
+                if entry_ts:
+                    entry_time = datetime.fromtimestamp(
+                        entry_ts, tz=timezone.utc).isoformat()
                     logger.info("  [%d] Entry time from trade history: %s", market_id, entry_time)
                     self._entry_times[key] = entry_time
                     self._save_entry_times()

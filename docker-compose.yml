@@ -20,7 +20,8 @@ services:
       - ./test_state.json:/app/bot_state.json
       - ./agent_keystore.json:/app/agent_keystore.json:ro
     command: ["python", "main.py", "--live"]
-    mem_limit: 250m
+    mem_limit: 400m
+    memswap_limit: 600m
     profiles: ["test"]
 
 volumes:

@@ -207,6 +207,7 @@ class StrategyRunner:
         self._tick_elapsed_history: list[float] = []
         self._pnl_tracker = PnLTracker()
         self._last_ifttt_summary_time = 0.0
+        self._last_summary_time = 0.0
         self._ifttt_summary_interval = 6 * 3600  # 6 hours
         # 24h rolling stats
         self._stats_entries = 0
@@ -312,9 +313,19 @@ class StrategyRunner:
                 # Write heartbeat
                 self._write_heartbeat(now, status="ok", elapsed=elapsed)
 
-                # Periodic full summary
+                # Periodic full summary — skip if nothing new, but force every 6h
                 if self._tick_count % self._summary_interval == 0:
-                    self._print_full_summary(now, all_events)
+                    has_activity = any(
+                        e.get('type') in ('entry', 'exit', 'exec_fail')
+                        for e in all_events
+                    )
+                    hours_since_summary = (
+                        (time.time() - self._last_summary_time) / 3600
+                        if self._last_summary_time else float('inf')
+                    )
+                    if has_activity or hours_since_summary >= 6:
+                        self._print_full_summary(now, all_events)
+                        self._last_summary_time = time.time()
 
                 logger.info("Tick completed in %.1fs", elapsed)
                 sleep_time = max(0, self.interval - elapsed)
