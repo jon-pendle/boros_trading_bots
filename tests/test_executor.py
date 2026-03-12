@@ -91,3 +91,51 @@ class TestSignAndSubmitVerification:
         executor = self._make_executor()
         result = executor._sign_and_submit(["0xcalldata"])
         assert result is not None
+
+    @patch("strategies.framework.executor.requests.request")
+    def test_mm_market_not_entered_ignored(self, mock_request):
+        """enterMarket revert with MMMarketNotEntered is benign → accepted.
+        Reproduces real scenario: dual close sends 4 calldatas
+        (enterMarket + close for each leg). If market already entered,
+        enterMarket simulate reverts but close succeeds."""
+        mock_request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [
+                {"status": "success", "txHash": "0xabc", "index": 0},  # enterMarket(A)
+                {"status": "success", "txHash": "0xabc", "index": 1},  # close(A)
+                {"status": "reverted", "error": "[SIMULATE] MMMarketNotEntered()", "index": 2},  # enterMarket(B) - already entered
+                {"status": "success", "txHash": "0xabc", "index": 3},  # close(B)
+            ],
+        )
+        executor = self._make_executor()
+        result = executor._sign_and_submit(["0x1", "0x2", "0x3", "0x4"])
+        assert result is not None
+        assert len(result) == 4
+
+    @patch("strategies.framework.executor.requests.request")
+    def test_market_already_entered_ignored(self, mock_request):
+        """MarketAlreadyEntered revert is also benign → accepted."""
+        mock_request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [
+                {"status": "reverted", "error": "MarketAlreadyEntered()", "index": 0},
+                {"status": "success", "txHash": "0xdef", "index": 1},
+            ],
+        )
+        executor = self._make_executor()
+        result = executor._sign_and_submit(["0x1", "0x2"])
+        assert result is not None
+
+    @patch("strategies.framework.executor.requests.request")
+    def test_real_revert_still_rejected(self, mock_request):
+        """Non-benign revert (e.g. AuthInvalidMessage) still fails."""
+        mock_request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [
+                {"status": "success", "txHash": "0xabc", "index": 0},
+                {"status": "reverted", "error": "AuthInvalidMessage()", "index": 1},
+            ],
+        )
+        executor = self._make_executor()
+        result = executor._sign_and_submit(["0x1", "0x2"])
+        assert result is None

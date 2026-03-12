@@ -254,15 +254,22 @@ class BorosExecutor(IExecutor):
                 data = resp.json()
                 logger.info("bulk-direct-call response: %s",
                             _json.dumps(data)[:500] if isinstance(data, (dict, list)) else str(data)[:500])
-                # Verify ALL transactions succeeded on-chain
+                # Verify transactions succeeded on-chain
+                # enterMarket reverts are non-fatal (market already entered)
                 if isinstance(data, list):
                     for d in data:
                         status = d.get("status", "")
+                        error = d.get("error", "")
                         if status != "success":
+                            if "MMMarketNotEntered" in error or "MarketAlreadyEntered" in error:
+                                logger.info(
+                                    "Ignoring benign revert: index=%s error=%s",
+                                    d.get("index"), error,
+                                )
+                                continue
                             logger.error(
                                 "Tx not successful: index=%s status=%s error=%s txHash=%s",
-                                d.get("index"), status,
-                                d.get("error", ""), d.get("txHash", ""),
+                                d.get("index"), status, error, d.get("txHash", ""),
                             )
                             return None
                 return data

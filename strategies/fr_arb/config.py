@@ -25,6 +25,9 @@ TICK_INTERVAL_SECONDS = 60
 DRY_RUN = True
 STATE_FILE = "fr_arb_state.json"
 
+# Dust threshold: positions below this size (tokens) are auto-closed
+DUST_THRESHOLD_TOKENS = 0.01
+
 # Capacity stepping
 CAPACITY_STEP_TOKENS = 5.0
 LIQUIDITY_FACTOR = float(os.environ.get("LIQUIDITY_FACTOR", "0.75"))

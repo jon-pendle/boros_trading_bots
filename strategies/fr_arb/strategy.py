@@ -323,8 +323,24 @@ class FRArbitrageStrategy(BaseStrategy):
                 logger.info("Position [%d] no longer on-chain, clearing state", mid)
                 context.state.clear_position(self.name, mid)
 
-        # Add/update on-chain positions in state
+        # Add/update on-chain positions in state (skip dust)
         for mid, onchain in self._onchain_positions.items():
+            # Auto-close dust positions
+            if onchain['size'] < config.DUST_THRESHOLD_TOKENS:
+                side_str = "SHORT" if onchain['side'] == 1 else "LONG"
+                logger.info("  [%d] Dust %s %.6f tokens — auto-closing",
+                            mid, side_str, onchain['size'])
+                try:
+                    context.executor.close_position(
+                        market_id=mid, side=onchain['side'],
+                        tokens=onchain['size'],
+                        tokens_wei=onchain.get('size_wei', ''),
+                    )
+                except Exception as e:
+                    logger.warning("  [%d] Dust close failed: %s", mid, e)
+                context.state.clear_position(self.name, mid)
+                continue
+
             existing = context.state.get_position(self.name, mid)
             if existing:
                 # Sync size + wei from on-chain
