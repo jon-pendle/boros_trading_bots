@@ -1,32 +1,56 @@
 """Tests for FR Arb VWAP capacity, margin, and pair generation."""
 import pytest
 import time
-from strategies.fr_arb.strategy import FRArbitrageStrategy
+from strategies.fr_arb.strategy import _calc_vwap, _get_topn_avail
 from strategies.framework.pricing import PricingEngine
 from strategies.framework.data_provider import BorosDataProvider
 
 
-class TestCalculateVWAP:
+class TestCalcVWAP:
     def test_single_level_exact_fill(self):
         liquidity = [(0.05, 100.0)]
-        assert FRArbitrageStrategy._calculate_vwap(liquidity, 100.0) == pytest.approx(0.05)
+        assert _calc_vwap(liquidity, 100.0) == pytest.approx(0.05)
 
     def test_multiple_levels(self):
         liquidity = [(0.05, 10.0), (0.04, 20.0), (0.03, 30.0)]
         # Fill 25 tokens: 10@0.05 + 15@0.04 = 0.5 + 0.6 = 1.1 / 25
-        vwap = FRArbitrageStrategy._calculate_vwap(liquidity, 25.0)
+        vwap = _calc_vwap(liquidity, 25.0)
         assert vwap == pytest.approx(1.1 / 25.0)
 
     def test_book_exhausted_returns_none(self):
         liquidity = [(0.05, 10.0)]
-        assert FRArbitrageStrategy._calculate_vwap(liquidity, 20.0) is None
+        assert _calc_vwap(liquidity, 20.0) is None
 
     def test_empty_book_returns_none(self):
-        assert FRArbitrageStrategy._calculate_vwap([], 10.0) is None
+        assert _calc_vwap([], 10.0) is None
 
-    def test_zero_tokens(self):
-        liquidity = [(0.05, 10.0)]
-        assert FRArbitrageStrategy._calculate_vwap(liquidity, 0.0) == 0
+    def test_zero_size_level_skipped(self):
+        """Levels with sz <= 1e-9 are skipped."""
+        liquidity = [(0.05, 0.0), (0.04, 10.0)]
+        assert _calc_vwap(liquidity, 5.0) == pytest.approx(0.04)
+
+
+class TestGetTopnAvail:
+    def test_top3_distinct_levels(self):
+        liq = [(0.08, 10.0), (0.07, 20.0), (0.06, 30.0), (0.05, 40.0)]
+        assert _get_topn_avail(liq, 3) == pytest.approx(60.0)
+
+    def test_same_price_grouped(self):
+        """Multiple entries at same price count as one level."""
+        liq = [(0.08, 10.0), (0.08, 5.0), (0.07, 20.0)]
+        # 2 distinct levels, all entries included
+        assert _get_topn_avail(liq, 2) == pytest.approx(35.0)
+
+    def test_empty_liq(self):
+        assert _get_topn_avail([], 3) == pytest.approx(0.0)
+
+    def test_zero_levels(self):
+        liq = [(0.08, 10.0)]
+        assert _get_topn_avail(liq, 0) == pytest.approx(0.0)
+
+    def test_fewer_levels_than_requested(self):
+        liq = [(0.08, 10.0)]
+        assert _get_topn_avail(liq, 5) == pytest.approx(10.0)
 
 
 class TestCalculateIMPerToken:

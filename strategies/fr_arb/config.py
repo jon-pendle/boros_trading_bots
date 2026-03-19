@@ -1,5 +1,5 @@
-# FR Arbitrage Configuration — $10k Capital
-# Aligned with backtest fr_arb_10k (Sharpe 3.98, 28.7% return)
+# FR Arbitrage Configuration — MarginalPnL Exit + Scale-In
+# Aligned with backtest marginal_pnl_exit (Sharpe 5.17, $28.7k PnL)
 import os
 
 # Boros API
@@ -10,7 +10,19 @@ ENTRY_SPREAD_THRESHOLD = float(os.environ.get("ENTRY_SPREAD_THRESHOLD", "0.042")
 EXIT_SPREAD_THRESHOLD = float(os.environ.get("EXIT_SPREAD_THRESHOLD", "0.038"))
 MIN_HOLD_HOURS = 1.0
 MAX_HOLD_HOURS = float('inf')    # No forced exit — exit only on spread convergence
-MAX_CAPITAL = float(os.environ.get("MAX_CAPITAL", "100"))  # per pair, split across 2 legs
+MAX_CAPITAL = float(os.environ.get("MAX_CAPITAL", "10000"))  # global across all pairs
+
+# Depth-weighted entry
+MIN_DEPTH_USD = float(os.environ.get("MIN_DEPTH_USD", "500.0"))
+DEPTH_UTILIZATION = float(os.environ.get("DEPTH_UTILIZATION", "0.3"))
+
+# Scale-in
+MAX_LAYERS = int(os.environ.get("MAX_LAYERS", "5"))
+MIN_ADDON_INTERVAL_HOURS = float(os.environ.get("MIN_ADDON_INTERVAL_HOURS", "12"))
+MIN_ADDON_TOKENS = float(os.environ.get("MIN_ADDON_TOKENS", "50"))
+
+# Exit batching
+EXIT_BATCH_MINUTES = int(os.environ.get("EXIT_BATCH_MINUTES", "15"))
 
 # Margin pre-check (requires USER_ADDRESS for collateral API)
 USER_ADDRESS = os.environ.get("USER_ADDRESS", "")
@@ -30,7 +42,7 @@ DUST_THRESHOLD_TOKENS = 0.01
 
 # Capacity stepping
 CAPACITY_STEP_TOKENS = 5.0
-LIQUIDITY_FACTOR = float(os.environ.get("LIQUIDITY_FACTOR", "0.75"))
+LIQUIDITY_FACTOR = float(os.environ.get("LIQUIDITY_FACTOR", "1.0"))
 MIN_ENTRY_USD = float(os.environ.get("MIN_ENTRY_USD", "10.0"))
 
 # Alerts

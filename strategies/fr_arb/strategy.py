@@ -1,12 +1,12 @@
 """
-FR Arbitrage Strategy
+FR Arbitrage Strategy — MarginalPnL Exit + Scale-In
 
-Exploits yield spreads between pairs of markets with different maturities
-for the same underlying asset.
-
-Entry: When spread between two maturities exceeds threshold.
-Exit: When spread narrows below threshold OR max hold time exceeded.
-Direction: Short the higher-rate maturity, long the lower-rate maturity.
+Entry: Mid-rate spread > threshold, depth-weighted ranking, global capital.
+Exit: Mid-rate spread < threshold triggers exit; marginal execution spread
+      scan determines depth (how many tokens to close). Top-3 OB levels
+      as floor, scan can only extend deeper.
+Scale-in: adds layers to existing positions when depth grows while spread
+          remains above entry threshold.
 """
 import logging
 import time
@@ -23,17 +23,49 @@ logger = logging.getLogger(__name__)
 OB_WORKERS = 8
 
 
+def _calc_vwap(liq, tokens):
+    """Walk OB levels, return VWAP rate for filling `tokens`. None if insufficient."""
+    remaining = tokens
+    total = 0.0
+    for px, sz in liq:
+        if sz <= 1e-9:
+            continue
+        take = min(remaining, sz)
+        total += take * px
+        remaining -= take
+        if remaining <= 1e-6:
+            return total / tokens
+    return None
+
+
+def _get_topn_avail(liq, n_levels):
+    """Sum available tokens in top-N distinct price levels."""
+    if not liq or n_levels <= 0:
+        return 0.0
+    seen_levels = set()
+    total = 0.0
+    for px, sz in liq:
+        if len(seen_levels) >= n_levels and px not in seen_levels:
+            break
+        seen_levels.add(px)
+        total += sz
+    return total
+
+
 class FRArbitrageStrategy(BaseStrategy):
     def __init__(self):
         super().__init__(name="fr_arb", target_markets=[])
-        self._ob_cache = {}  # per-tick orderbook cache
-        self._collateral_cache = {}  # per-tick: {tokenId: availableBalance}
-        self._im_params_cache = {}  # per-tick: {market_id: im_params_dict}
-        self._onchain_positions = {}  # per-tick: {market_id: {side, size, ...}}
-        self._pairs = {}  # dynamically generated: {label: (mkt_a, mkt_b)}
+        self._ob_cache = {}
+        self._collateral_cache = {}
+        self._im_params_cache = {}
+        self._onchain_positions = {}
+        self._pairs = {}
+
+    # ------------------------------------------------------------------
+    # Orderbook helpers
+    # ------------------------------------------------------------------
 
     def _prefetch_orderbooks(self, context: IContext):
-        """Fetch all orderbooks in parallel at tick start."""
         market_ids = list(self.target_markets)
 
         def fetch(mid):
@@ -51,36 +83,32 @@ class FRArbitrageStrategy(BaseStrategy):
                     self._ob_cache[mid] = {"bids": [], "asks": []}
 
     def _get_orderbook(self, context: IContext, market_id: int) -> dict:
-        """Get orderbook from per-tick cache."""
         if market_id not in self._ob_cache:
             self._ob_cache[market_id] = context.data.get_orderbook(market_id)
         return self._ob_cache[market_id]
 
     def _get_best_prices(self, context: IContext, market_id: int):
-        """Get best bid/ask from orderbook. Returns (None, None) if illiquid."""
         book = self._get_orderbook(context, market_id)
         bids = book.get('bids', [])
         asks = book.get('asks', [])
-
         if not bids or not asks:
             return None, None
-
         best_bid = bids[0][0]
         best_ask = asks[0][0]
-
         if abs(best_bid) > 1.0 or abs(best_ask) > 1.0:
             return None, None
-
         return best_bid, best_ask
 
+    # ------------------------------------------------------------------
+    # Margin helpers (unchanged from previous version)
+    # ------------------------------------------------------------------
+
     def _get_im_params(self, context: IContext, market_id: int) -> dict:
-        """Extract IM parameters from market info. Cached per tick."""
         if market_id in self._im_params_cache:
             return self._im_params_cache[market_id]
         info = context.data.get_market_info(market_id)
         im_data = info.get('imData', {})
         cfg = info.get('config', {})
-        # kIM is stored as BigInt string with 18 decimals
         k_im_raw = cfg.get('kIM', '0')
         try:
             k_im = int(k_im_raw) / 1e18
@@ -99,19 +127,12 @@ class FRArbitrageStrategy(BaseStrategy):
 
     def _check_margin(self, context: IContext, mkt_A: int, mkt_B: int,
                       rate_A: float, rate_B: float,
-                      spot_price: float) -> tuple[bool, float]:
-        """
-        Margin pre-check: can we open even 1 token on both legs?
-        Returns (has_margin, max_tokens_by_margin).
-        If collateral data unavailable, returns (True, inf) to skip the check.
-        """
+                      spot_price: float) -> tuple:
         if not self._collateral_cache:
             return True, float('inf')
-
         now_ts = time.time()
         params_A = self._get_im_params(context, mkt_A)
         params_B = self._get_im_params(context, mkt_B)
-
         info_A = context.data.get_market_info(mkt_A)
         info_B = context.data.get_market_info(mkt_B)
         maturity_A = int(info_A.get('imData', {}).get('maturity', 0))
@@ -136,8 +157,6 @@ class FRArbitrageStrategy(BaseStrategy):
             time_to_maturity_seconds=ttm_B,
         )
 
-        # IM is denominated in collateral token (not USD).
-        # im_per_token = IM required per 1 token of position size, in collateral units.
         tid_A = params_A['token_id']
         tid_B = params_B['token_id']
         avail_A = self._collateral_cache.get(tid_A, 0)
@@ -146,32 +165,23 @@ class FRArbitrageStrategy(BaseStrategy):
         if im_per_token_A <= 0 or im_per_token_B <= 0:
             return True, float('inf')
 
-        max_tokens_A = avail_A / im_per_token_A if im_per_token_A > 0 else float('inf')
-        max_tokens_B = avail_B / im_per_token_B if im_per_token_B > 0 else float('inf')
-
-        # Both legs share same collateral pool if same tokenId
         if tid_A == tid_B:
             combined_im = im_per_token_A + im_per_token_B
             max_tokens = avail_A / combined_im if combined_im > 0 else float('inf')
         else:
+            max_tokens_A = avail_A / im_per_token_A
+            max_tokens_B = avail_B / im_per_token_B
             max_tokens = min(max_tokens_A, max_tokens_B)
 
-        has_margin = max_tokens >= 1.0
-        return has_margin, max_tokens
+        return max_tokens >= 1.0, max_tokens
 
     def _deduct_im_from_cache(self, context: IContext, mkt_A: int, mkt_B: int,
                               rate_A: float, rate_B: float, tokens: float):
-        """
-        After a successful entry, reduce _collateral_cache by estimated IM
-        so subsequent entries in the same tick see reduced available balance.
-        """
         if not self._collateral_cache:
             return
-
         now_ts = time.time()
         params_A = self._get_im_params(context, mkt_A)
         params_B = self._get_im_params(context, mkt_B)
-
         info_A = context.data.get_market_info(mkt_A)
         info_B = context.data.get_market_info(mkt_B)
         ttm_A = max(0, int(info_A.get('imData', {}).get('maturity', 0)) - now_ts)
@@ -196,26 +206,150 @@ class FRArbitrageStrategy(BaseStrategy):
 
         tid_A = params_A['token_id']
         tid_B = params_B['token_id']
-
         if tid_A in self._collateral_cache:
             self._collateral_cache[tid_A] = max(0, self._collateral_cache[tid_A] - im_A)
         if tid_B in self._collateral_cache:
             self._collateral_cache[tid_B] = max(0, self._collateral_cache[tid_B] - im_B)
-
         logger.info("  IM deducted: tid=%d -%.4f, tid=%d -%.4f", tid_A, im_A, tid_B, im_B)
 
-    def on_tick(self, context: IContext) -> list[dict]:
-        self._ob_cache.clear()  # fresh cache each tick
+    # ------------------------------------------------------------------
+    # Capital tracking
+    # ------------------------------------------------------------------
+
+    def _get_total_allocated(self, context: IContext) -> float:
+        """Sum position_size across all open positions (global capital)."""
+        all_pos = context.state.get_all_positions(self.name)
+        return sum(abs(p.get('position_size', 0)) for p in all_pos.values())
+
+    # ------------------------------------------------------------------
+    # VWAP capacity scan (entry sizing)
+    # ------------------------------------------------------------------
+
+    def _run_vwap_capacity_scan(self, context, mkt_A, mkt_B, best_scenario,
+                                bid_A, ask_A, bid_B, ask_B,
+                                spot_price, effective_capital) -> float:
+        """Run VWAP capacity scan. Returns max_safe_tokens."""
+        book_A = self._get_orderbook(context, mkt_A)
+        book_B = self._get_orderbook(context, mkt_B)
+
+        if best_scenario == 1:
+            liquidity_A = book_A.get('bids', [])
+            liquidity_B = book_B.get('asks', [])
+        else:
+            liquidity_A = book_A.get('asks', [])
+            liquidity_B = book_B.get('bids', [])
+
+        info_cap = context.data.get_market_info(mkt_A)
+        maturity_ts = int(info_cap.get('imData', {}).get('maturity', 0))
+        now_ts = time.time()
+        time_remaining_years = max(0.0, (maturity_ts - now_ts) / 31_536_000)
+
+        max_yield_price = max(bid_A, ask_B) if best_scenario == 1 else max(bid_B, ask_A)
+        if max_yield_price <= 0:
+            max_yield_price = 0.01
+        token_position_value = abs(max_yield_price) * time_remaining_years * spot_price
+        if token_position_value <= 0:
+            token_position_value = 0.01
+
+        max_allowed_tokens = effective_capital / token_position_value
+
+        step = config.CAPACITY_STEP_TOKENS
+        test_tokens = 0.0
+        max_safe_tokens = 0.0
+
+        while True:
+            next_test = min(test_tokens + step, max_allowed_tokens)
+            if next_test <= test_tokens:
+                break
+            test_tokens = next_test
+
+            vwap_A = _calc_vwap(liquidity_A, test_tokens)
+            if vwap_A is None:
+                break
+            vwap_B = _calc_vwap(liquidity_B, test_tokens)
+            if vwap_B is None:
+                break
+
+            test_spread = (vwap_A - vwap_B if best_scenario == 1
+                           else vwap_B - vwap_A)
+            if test_spread < config.ENTRY_SPREAD_THRESHOLD:
+                break
+            max_safe_tokens = test_tokens
+            if test_tokens >= max_allowed_tokens:
+                break
+
+        return max_safe_tokens * config.LIQUIDITY_FACTOR
+
+    # ------------------------------------------------------------------
+    # Marginal execution spread scan (exit depth)
+    # ------------------------------------------------------------------
+
+    def _marginal_pnl_tokens(self, exit_liq_A, exit_liq_B, side_A,
+                             total_tokens) -> float:
+        """Token-based execution spread scan: max tokens where marginal
+        execution spread stays below EXIT_SPREAD_THRESHOLD.
+
+        Each leg fills independently via VWAP. The stopping criterion
+        enforces that the marginal slice's execution spread is consistent
+        with the exit trigger threshold.
+
+        Returns max closeable tokens (0 if nothing passes).
+        """
+        exit_threshold = config.EXIT_SPREAD_THRESHOLD
+        max_closeable = 0.0
+        prev_cum_A = 0.0
+        prev_cum_B = 0.0
+        step = max(1.0, total_tokens / 100.0)
+        test = 0.0
+
+        while test < total_tokens:
+            test = min(test + step, total_tokens)
+
+            vwap_A = _calc_vwap(exit_liq_A, test)
+            vwap_B = _calc_vwap(exit_liq_B, test)
+            if vwap_A is None or vwap_B is None:
+                break
+
+            cum_A = vwap_A * test
+            cum_B = vwap_B * test
+
+            slice_tokens = test - max_closeable
+            if slice_tokens < 0.01:
+                break
+            slice_apr_A = (cum_A - prev_cum_A) / slice_tokens
+            slice_apr_B = (cum_B - prev_cum_B) / slice_tokens
+
+            # Marginal execution spread for this slice
+            if side_A == 1:  # short A, long B
+                marginal_exec_spread = slice_apr_A - slice_apr_B
+            else:  # long A, short B
+                marginal_exec_spread = slice_apr_B - slice_apr_A
+
+            if marginal_exec_spread >= exit_threshold:
+                break
+
+            max_closeable = test
+            prev_cum_A = cum_A
+            prev_cum_B = cum_B
+
+        return max_closeable
+
+    # ------------------------------------------------------------------
+    # Main tick
+    # ------------------------------------------------------------------
+
+    def on_tick(self, context: IContext) -> list:
+        self._ob_cache.clear()
         self._collateral_cache.clear()
         self._im_params_cache.clear()
         self._onchain_positions.clear()
         self._collateral_fetch_ok = False
         events = []
 
-        # Pre-fetch all market info (populates cache for pair generation)
+        # Pre-fetch all market info
         context.data.get_all_market_ids()
 
-        # Dynamically generate pairs from active markets
+        # Dynamically generate pairs
         self._pairs = context.data.generate_pairs(
             allowed_token_ids=config.ALLOWED_TOKEN_IDS or None)
         targets = set()
@@ -227,7 +361,7 @@ class FRArbitrageStrategy(BaseStrategy):
         # Pre-fetch orderbooks in parallel
         self._prefetch_orderbooks(context)
 
-        # Fetch collateral detail for margin pre-check + on-chain position check
+        # Fetch collateral + on-chain positions
         if config.USER_ADDRESS and hasattr(context.data, 'get_collateral_detail'):
             try:
                 detail = context.data.get_collateral_detail(config.USER_ADDRESS)
@@ -237,52 +371,44 @@ class FRArbitrageStrategy(BaseStrategy):
                         self._onchain_positions[pos['market_id']] = pos
                 self._collateral_fetch_ok = True
             except Exception as e:
-                logger.warning("Collateral fetch failed, skipping margin check: %s", e)
+                logger.warning("Collateral fetch failed: %s", e)
 
-        # Sync state from on-chain data (source of truth)
+        # Sync state from on-chain (source of truth)
         self._sync_state_from_onchain(context)
 
-        processed_orphans: set[int] = set()
+        processed_orphans: set = set()
 
+        # ================================================================
+        # EXIT PASS: mid-rate signal + marginal execution spread depth
+        # ================================================================
         for pair_name, (mkt_A, mkt_B) in self._pairs.items():
             pos_A = context.state.get_position(self.name, mkt_A)
             pos_B = context.state.get_position(self.name, mkt_B)
 
             bid_A, ask_A = self._get_best_prices(context, mkt_A)
             bid_B, ask_B = self._get_best_prices(context, mkt_B)
-
             if None in [bid_A, ask_A, bid_B, ask_B]:
                 continue
-
-            info_A = context.data.get_market_info(mkt_A)
-            info_B = context.data.get_market_info(mkt_B)
-            tick_step_A = float(info_A.get('imData', {}).get('tickStep', 1))
-            tick_step_B = float(info_B.get('imData', {}).get('tickStep', 1))
 
             events.append({
                 "type": "scan",
                 "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
+                "market_id_a": mkt_A, "market_id_b": mkt_B,
                 "bid_a": bid_A, "ask_a": ask_A,
                 "bid_b": bid_B, "ask_b": ask_B,
                 "has_position": pos_A is not None and pos_B is not None,
             })
 
-            # --- EXIT LOGIC ---
             if pos_A and pos_B:
                 exit_events = self._check_exit(
                     context, pair_name, mkt_A, mkt_B, pos_A, pos_B,
-                    bid_A, ask_A, bid_B, ask_B,
-                )
+                    bid_A, ask_A, bid_B, ask_B)
                 events.extend(exit_events)
 
-            # --- ORPHAN: only one leg in THIS pair ---
             elif pos_A or pos_B:
                 orphan_mid = mkt_A if pos_A else mkt_B
                 if orphan_mid in processed_orphans:
                     continue
-                # Check if this market is paired with ANY other market
                 is_paired = False
                 for _, (a, b) in self._pairs.items():
                     partner = b if a == orphan_mid else (a if b == orphan_mid else None)
@@ -295,37 +421,196 @@ class FRArbitrageStrategy(BaseStrategy):
                         context, pair_name, mkt_A, mkt_B, pos_A, pos_B)
                     events.extend(orphan_events)
 
-            # --- ENTRY LOGIC ---
+        # ================================================================
+        # ENTRY + SCALE-IN PASS: collect candidates, rank by depth
+        # ================================================================
+        entry_candidates = []
+        scalein_candidates = []
+
+        for pair_name, (mkt_A, mkt_B) in self._pairs.items():
+            pos_A = context.state.get_position(self.name, mkt_A)
+            pos_B = context.state.get_position(self.name, mkt_B)
+
+            bid_A, ask_A = self._get_best_prices(context, mkt_A)
+            bid_B, ask_B = self._get_best_prices(context, mkt_B)
+            if None in [bid_A, ask_A, bid_B, ask_B]:
+                continue
+
+            # Mid-rate spread signal
+            mid_A = (bid_A + ask_A) / 2.0
+            mid_B = (bid_B + ask_B) / 2.0
+            spread_1 = mid_A - mid_B
+            spread_2 = mid_B - mid_A
+            best_scenario = 1 if spread_1 > spread_2 else 2
+            max_spread = max(spread_1, spread_2)
+
+            if max_spread <= config.ENTRY_SPREAD_THRESHOLD:
+                continue
+
+            # On-chain position check for new entries
+            if not pos_A and not pos_B:
+                if self._onchain_positions and (
+                        mkt_A in self._onchain_positions or mkt_B in self._onchain_positions):
+                    events.append({
+                        "type": "skip", "pair": pair_name,
+                        "market_id_a": mkt_A, "market_id_b": mkt_B,
+                        "spread": round(max_spread, 6),
+                        "reason": "onchain_position_exists",
+                    })
+                    continue
+
+            # Depth score
+            spot_price = context.data.get_spot_price(mkt_A) or 1.0
+            book_A = self._get_orderbook(context, mkt_A)
+            book_B = self._get_orderbook(context, mkt_B)
+
+            if best_scenario == 1:
+                depth_A = sum(sz for _, sz in book_A.get('bids', []))
+                depth_B = sum(sz for _, sz in book_B.get('asks', []))
+            else:
+                depth_A = sum(sz for _, sz in book_A.get('asks', []))
+                depth_B = sum(sz for _, sz in book_B.get('bids', []))
+
+            depth_score = min(depth_A, depth_B) * spot_price
+            if depth_score < config.MIN_DEPTH_USD:
+                events.append({
+                    "type": "skip", "pair": pair_name,
+                    "market_id_a": mkt_A, "market_id_b": mkt_B,
+                    "spread": round(max_spread, 6),
+                    "reason": "insufficient_depth",
+                })
+                continue
+
+            cand = {
+                'pair_name': pair_name, 'mkt_A': mkt_A, 'mkt_B': mkt_B,
+                'bid_A': bid_A, 'ask_A': ask_A, 'bid_B': bid_B, 'ask_B': ask_B,
+                'best_scenario': best_scenario, 'max_spread': max_spread,
+                'depth_score': depth_score, 'spot_price': spot_price,
+            }
+
+            if pos_A and pos_B:
+                # Scale-in candidate
+                layers = pos_A.get('layers', [])
+                if len(layers) >= config.MAX_LAYERS:
+                    continue
+                last_addon = datetime.fromisoformat(
+                    pos_A.get('last_addon_time', pos_A['entry_time']))
+                hours_since = (context.now - last_addon).total_seconds() / 3600
+                if hours_since < config.MIN_ADDON_INTERVAL_HOURS:
+                    continue
+                if pos_A['side'] != (1 if best_scenario == 1 else 0):
+                    continue
+                cand['current_tokens'] = pos_A['tokens']
+                cand['layers'] = layers
+                scalein_candidates.append(cand)
             elif not pos_A and not pos_B:
-                entry_events = self._check_entry(
-                    context, pair_name, mkt_A, mkt_B,
-                    bid_A, ask_A, bid_B, ask_B,
-                    tick_step_A, tick_step_B,
-                )
-                events.extend(entry_events)
+                # Margin pre-check
+                rate_A = bid_A if best_scenario == 1 else ask_A
+                rate_B = ask_B if best_scenario == 1 else bid_B
+                has_margin, margin_max = self._check_margin(
+                    context, mkt_A, mkt_B, rate_A, rate_B, spot_price)
+                if not has_margin:
+                    events.append({
+                        "type": "skip", "pair": pair_name,
+                        "market_id_a": mkt_A, "market_id_b": mkt_B,
+                        "spread": round(max_spread, 6),
+                        "reason": "insufficient_margin",
+                    })
+                    continue
+                cand['margin_max'] = margin_max
+                entry_candidates.append(cand)
+
+        # Process new entries (sorted by depth_score descending)
+        entry_candidates.sort(key=lambda c: c['depth_score'], reverse=True)
+        for cand in entry_candidates:
+            total_allocated = self._get_total_allocated(context)
+            remaining_capital = config.MAX_CAPITAL - total_allocated
+            if remaining_capital <= 0:
+                break
+
+            depth_based_capital = cand['depth_score'] * config.DEPTH_UTILIZATION
+            effective_capital = min(depth_based_capital, remaining_capital / 2.0)
+
+            tokens = self._run_vwap_capacity_scan(
+                context, cand['mkt_A'], cand['mkt_B'], cand['best_scenario'],
+                cand['bid_A'], cand['ask_A'], cand['bid_B'], cand['ask_B'],
+                cand['spot_price'], effective_capital)
+
+            # Also cap by margin
+            margin_max = cand.get('margin_max', float('inf'))
+            if tokens > margin_max:
+                tokens = margin_max
+
+            info_cap = context.data.get_market_info(cand['mkt_A'])
+            maturity_ts = int(info_cap.get('imData', {}).get('maturity', 0))
+            ttr = max(0.0, (maturity_ts - time.time()) / 31_536_000)
+            max_yield = (max(cand['bid_A'], cand['ask_B']) if cand['best_scenario'] == 1
+                         else max(cand['bid_B'], cand['ask_A']))
+            tpv = abs(max_yield) * ttr * cand['spot_price'] if max_yield else 0.01
+            estimated_usd = tokens * tpv
+
+            if tokens < 0.01 or estimated_usd < config.MIN_ENTRY_USD:
+                events.append({
+                    "type": "skip", "pair": cand['pair_name'],
+                    "market_id_a": cand['mkt_A'], "market_id_b": cand['mkt_B'],
+                    "spread": round(cand['max_spread'], 6),
+                    "reason": "insufficient_capacity",
+                })
+                continue
+
+            entry_events = self._execute_entry(
+                context, cand, tokens, layers=None)
+            events.extend(entry_events)
+
+        # Process scale-in candidates
+        scalein_candidates.sort(key=lambda c: c['depth_score'], reverse=True)
+        for cand in scalein_candidates:
+            total_allocated = self._get_total_allocated(context)
+            remaining_capital = config.MAX_CAPITAL - total_allocated
+            if remaining_capital <= 0:
+                break
+
+            depth_based_capital = cand['depth_score'] * config.DEPTH_UTILIZATION
+            effective_capital = min(depth_based_capital, remaining_capital / 2.0)
+
+            total_capacity = self._run_vwap_capacity_scan(
+                context, cand['mkt_A'], cand['mkt_B'], cand['best_scenario'],
+                cand['bid_A'], cand['ask_A'], cand['bid_B'], cand['ask_B'],
+                cand['spot_price'], effective_capital)
+
+            addon_tokens = total_capacity - cand['current_tokens']
+            if addon_tokens < config.MIN_ADDON_TOKENS:
+                continue
+
+            max_yield = (max(cand['bid_A'], cand['ask_B']) if cand['best_scenario'] == 1
+                         else max(cand['bid_B'], cand['ask_A']))
+            estimated_usd = addon_tokens * abs(max_yield) if max_yield else 0
+            if estimated_usd < config.MIN_ENTRY_USD:
+                continue
+
+            entry_events = self._execute_entry(
+                context, cand, addon_tokens, layers=cand['layers'])
+            events.extend(entry_events)
 
         return events
 
+    # ------------------------------------------------------------------
+    # State sync from on-chain
+    # ------------------------------------------------------------------
+
     def _sync_state_from_onchain(self, context: IContext):
-        """
-        Rebuild state from on-chain positions each tick.
-        On-chain data is the source of truth — state is just a projection.
-        """
         if not self._collateral_fetch_ok:
             return
 
         all_pos = context.state.get_all_positions(self.name)
         onchain_ids = set(self._onchain_positions.keys())
 
-        # Remove positions no longer on-chain
         for mid in list(all_pos.keys()):
             if mid not in onchain_ids:
                 logger.info("Position [%d] no longer on-chain, clearing state", mid)
                 context.state.clear_position(self.name, mid)
 
-        # Add/update on-chain positions in state (skip dust)
         for mid, onchain in self._onchain_positions.items():
-            # Auto-close dust positions
             if onchain['size'] < config.DUST_THRESHOLD_TOKENS:
                 side_str = "SHORT" if onchain['side'] == 1 else "LONG"
                 logger.info("  [%d] Dust %s %.6f tokens — auto-closing",
@@ -343,12 +628,11 @@ class FRArbitrageStrategy(BaseStrategy):
 
             existing = context.state.get_position(self.name, mid)
             if existing:
-                # Sync size + wei from on-chain
+                # Sync size/wei/side from on-chain, preserve layers + entry APRs
                 existing['tokens'] = onchain['size']
                 existing['tokens_wei'] = onchain.get('size_wei', '')
                 existing['side'] = onchain['side']
             else:
-                # New position — look up entry_time
                 entry_time = None
                 if hasattr(context.state, 'get_entry_time'):
                     entry_time = context.state.get_entry_time(self.name, mid)
@@ -364,17 +648,26 @@ class FRArbitrageStrategy(BaseStrategy):
                     "tokens": onchain['size'],
                     "tokens_wei": onchain.get('size_wei', ''),
                     "token_id": onchain.get('token_id', 0),
+                    "layers": [{
+                        "round_id": f"recovered_{mid}",
+                        "tokens": onchain['size'],
+                        "position_size_A": 0,
+                        "position_size_B": 0,
+                        "entry_time": entry_time,
+                        "entry_apr_A": onchain.get('entry_rate', 0),
+                        "entry_apr_B": 0,
+                    }],
                 })
                 side_str = "SHORT" if onchain['side'] == 1 else "LONG"
                 logger.info("  Synced [%d] %s %.4f tokens from on-chain",
                             mid, side_str, onchain['size'])
 
+    # ------------------------------------------------------------------
+    # Orphan close
+    # ------------------------------------------------------------------
+
     def _close_orphan(self, context, pair_name, mkt_A, mkt_B,
-                      pos_A, pos_B) -> list[dict]:
-        """
-        Auto-close an orphan position (one leg missing, other still open).
-        State is already synced with on-chain, so the position is confirmed to exist.
-        """
+                      pos_A, pos_B) -> list:
         events = []
         orphan_pos = pos_A or pos_B
         orphan_mid = mkt_A if pos_A else mkt_B
@@ -398,10 +691,8 @@ class FRArbitrageStrategy(BaseStrategy):
         if result:
             context.state.clear_position(self.name, orphan_mid)
             events.append({
-                "type": "exit",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
+                "type": "exit", "pair": pair_name,
+                "market_id_a": mkt_A, "market_id_b": mkt_B,
                 "reason": "orphan_auto_close",
                 "current_spread": 0,
                 "duration_hours": round(duration_hours, 2),
@@ -409,96 +700,109 @@ class FRArbitrageStrategy(BaseStrategy):
                 "round_id": orphan_pos.get('round_id', ''),
             })
         else:
-            logger.warning("[%s] Orphan close failed [%d], will retry next tick",
-                           pair_name, orphan_mid)
             events.append({
-                "type": "exec_fail",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
+                "type": "exec_fail", "pair": pair_name,
+                "market_id_a": mkt_A, "market_id_b": mkt_B,
                 "reason": "orphan_close_failed",
-                "spread": 0,
-                "tokens": round(tokens, 4),
+                "spread": 0, "tokens": round(tokens, 4),
             })
-
         return events
 
+    # ------------------------------------------------------------------
+    # EXIT: mid-rate signal + marginal execution spread depth
+    # ------------------------------------------------------------------
+
     def _check_exit(self, context, pair_name, mkt_A, mkt_B, pos_A, pos_B,
-                    bid_A, ask_A, bid_B, ask_B) -> list[dict]:
+                    bid_A, ask_A, bid_B, ask_B) -> list:
         events = []
         entry_time = datetime.fromisoformat(pos_A['entry_time'])
         duration_hours = (context.now - entry_time).total_seconds() / 3600
+        side_A = pos_A['side']
 
-        side_A = pos_A['side']  # 1=SHORT, 0=LONG
-
-        # Close rates: reverse the entry direction
-        close_rate_A = ask_A if side_A == 1 else bid_A
-        close_rate_B = bid_B if side_A == 1 else ask_B
-
-        # Current spread in the same direction as entry
+        # Mid-rate spread signal
+        mid_A = (bid_A + ask_A) / 2.0
+        mid_B = (bid_B + ask_B) / 2.0
         if side_A == 1:
-            current_spread = close_rate_A - close_rate_B
+            current_spread = mid_A - mid_B
         else:
-            current_spread = close_rate_B - close_rate_A
+            current_spread = mid_B - mid_A
 
         force_close = duration_hours >= config.MAX_HOLD_HOURS
-        normal_close = (
+        is_exit_signal = (
             current_spread < config.EXIT_SPREAD_THRESHOLD
             and duration_hours >= config.MIN_HOLD_HOURS
         )
 
-        if not (normal_close or force_close):
-            events.append({
-                "type": "hold",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
-                "current_spread": round(current_spread, 6),
-                "duration_hours": round(duration_hours, 2),
-                "tokens_a": pos_A['tokens'],
-                "tokens_b": pos_B['tokens'],
-            })
+        should_close = False
+        if force_close:
+            should_close = True
+        elif is_exit_signal:
+            # Exit batching: only attempt every EXIT_BATCH_MINUTES
+            last_close = pos_A.get('last_exit_batch_time')
+            if last_close is None:
+                should_close = True
+            else:
+                minutes_since = (context.now - datetime.fromisoformat(last_close)).total_seconds() / 60
+                if minutes_since >= config.EXIT_BATCH_MINUTES:
+                    should_close = True
+
+        if not should_close:
+            if pos_A and pos_B:
+                events.append({
+                    "type": "hold", "pair": pair_name,
+                    "market_id_a": mkt_A, "market_id_b": mkt_B,
+                    "current_spread": round(current_spread, 6),
+                    "duration_hours": round(duration_hours, 2),
+                    "tokens_a": pos_A['tokens'],
+                    "tokens_b": pos_B['tokens'],
+                })
             return events
 
-        # Use cached orderbooks for liquidity check
+        # Determine exit depth
         book_A = self._get_orderbook(context, mkt_A)
         book_B = self._get_orderbook(context, mkt_B)
 
         if side_A == 1:
-            liq_A = book_A.get('asks', [])
-            liq_B = book_B.get('bids', [])
+            exit_liq_A = book_A.get('asks', [])
+            exit_liq_B = book_B.get('bids', [])
         else:
-            liq_A = book_A.get('bids', [])
-            liq_B = book_B.get('asks', [])
+            exit_liq_A = book_A.get('bids', [])
+            exit_liq_B = book_B.get('asks', [])
 
-        tokens_A = pos_A['tokens']
-        tokens_B = pos_B['tokens']
-        target_close = min(tokens_A, tokens_B)
+        total_tokens = pos_A['tokens']
 
-        # Use full book depth (all levels) — the FOK order with slippage
-        # protection will handle price limits on-chain.
-        avail_A = sum(sz for _, sz in liq_A)
-        avail_B = sum(sz for _, sz in liq_B)
+        if force_close:
+            avail_A = sum(sz for _, sz in exit_liq_A)
+            avail_B = sum(sz for _, sz in exit_liq_B)
+            safe_close_tokens = min(total_tokens, avail_A, avail_B)
+        else:
+            # Top-3 floor (proven baseline)
+            top3_A = _get_topn_avail(exit_liq_A, 3)
+            top3_B = _get_topn_avail(exit_liq_B, 3)
+            top3_tokens = min(total_tokens, top3_A, top3_B)
 
-        safe_close_tokens = min(target_close, avail_A, avail_B)
+            # Marginal execution spread scan
+            scan_tokens = self._marginal_pnl_tokens(
+                exit_liq_A, exit_liq_B, side_A, total_tokens)
+
+            # Top3 is floor, scan can only extend
+            safe_close_tokens = max(top3_tokens, scan_tokens)
+
         if safe_close_tokens < 0.1:
             return events
 
         reason = "FORCE (Max Time)" if force_close else f"Spread={current_spread:.2%}"
         logger.info("[%s] EXIT %s, Closing=%.1f/%.1f Tokens",
-                    pair_name, reason, safe_close_tokens, target_close)
-
-        size_usd_A = safe_close_tokens * (ask_A if side_A == 1 else bid_A)
-        size_usd_B = safe_close_tokens * (bid_B if side_A == 1 else ask_B)
+                    pair_name, reason, safe_close_tokens, total_tokens)
 
         round_id = pos_A.get('round_id', f"{pair_name}_{pos_A['entry_time']}")
 
-        # Pass exact wei values when closing full position to avoid float dust
-        full_close = (safe_close_tokens >= target_close - 0.1)
+        # Pass exact wei values when closing full position
+        full_close = (safe_close_tokens >= total_tokens - 0.1)
         wei_a = pos_A.get('tokens_wei', '') if full_close else ''
         wei_b = pos_B.get('tokens_wei', '') if full_close else ''
 
-        # Atomic dual close: both legs succeed or both fail
+        # Atomic dual close
         result = context.executor.close_dual_position(
             mkt_a=mkt_A, side_a=side_A, tokens_a=safe_close_tokens,
             mkt_b=mkt_B, side_b=pos_B['side'], tokens_b=safe_close_tokens,
@@ -507,20 +811,28 @@ class FRArbitrageStrategy(BaseStrategy):
         )
 
         if result:
+            close_fraction = safe_close_tokens / total_tokens if total_tokens > 0 else 1.0
+
+            # Update layers proportionally
+            layers = pos_A.get('layers', [])
+            for layer in layers:
+                layer['tokens'] *= (1 - close_fraction)
+
             pos_A['tokens'] -= safe_close_tokens
             pos_B['tokens'] -= safe_close_tokens
-            pos_A['position_size'] = pos_A.get('position_size', 0) - size_usd_A
-            pos_B['position_size'] = pos_B.get('position_size', 0) - size_usd_B
+            pos_A['position_size'] = pos_A.get('position_size', 0) * (1 - close_fraction)
+            pos_B['position_size'] = pos_B.get('position_size', 0) * (1 - close_fraction)
 
             if pos_A['tokens'] < 0.1:
                 context.state.clear_position(self.name, mkt_A)
                 context.state.clear_position(self.name, mkt_B)
+            else:
+                pos_A['last_exit_batch_time'] = context.now.isoformat()
+                pos_B['last_exit_batch_time'] = context.now.isoformat()
 
             events.append({
-                "type": "exit",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
+                "type": "exit", "pair": pair_name,
+                "market_id_a": mkt_A, "market_id_b": mkt_B,
                 "reason": reason,
                 "current_spread": round(current_spread, 6),
                 "duration_hours": round(duration_hours, 2),
@@ -528,11 +840,9 @@ class FRArbitrageStrategy(BaseStrategy):
                 "round_id": round_id,
             })
         else:
-            # Atomic: both legs rejected together, will retry next tick
             logger.warning("[%s] EXIT failed (atomic), will retry next tick", pair_name)
             events.append({
-                "type": "exec_fail",
-                "pair": pair_name,
+                "type": "exec_fail", "pair": pair_name,
                 "market_id_a": mkt_A, "market_id_b": mkt_B,
                 "reason": "dual_exit_failed",
                 "spread": round(current_spread, 6),
@@ -541,148 +851,40 @@ class FRArbitrageStrategy(BaseStrategy):
 
         return events
 
-    def _check_entry(self, context, pair_name, mkt_A, mkt_B,
-                     bid_A, ask_A, bid_B, ask_B,
-                     tick_step_A, tick_step_B) -> list[dict]:
+    # ------------------------------------------------------------------
+    # ENTRY: atomic dual order with layer tracking
+    # ------------------------------------------------------------------
+
+    def _execute_entry(self, context, cand, tokens, layers=None) -> list:
+        """Execute entry (or scale-in) with layer tracking."""
         events = []
+        mkt_A = cand['mkt_A']
+        mkt_B = cand['mkt_B']
+        bid_A, ask_A = cand['bid_A'], cand['ask_A']
+        bid_B, ask_B = cand['bid_B'], cand['ask_B']
+        best_scenario = cand['best_scenario']
+        pair_name = cand['pair_name']
+        is_scalein = layers is not None
 
-        # Scenario 1: Short A (Bid_A), Long B (Ask_B)
-        spread_1 = bid_A - ask_B
-        # Scenario 2: Short B (Bid_B), Long A (Ask_A)
-        spread_2 = bid_B - ask_A
+        info_A = context.data.get_market_info(mkt_A)
+        info_B = context.data.get_market_info(mkt_B)
+        tick_step_A = float(info_A.get('imData', {}).get('tickStep', 1))
+        tick_step_B = float(info_B.get('imData', {}).get('tickStep', 1))
 
-        best_scenario = 1 if spread_1 > spread_2 else 2
-        max_spread = max(spread_1, spread_2)
-
-        if max_spread <= config.ENTRY_SPREAD_THRESHOLD:
-            return events
-
-        # On-chain position check: skip if either market already has a position
-        if self._onchain_positions and (
-                mkt_A in self._onchain_positions or mkt_B in self._onchain_positions):
-            onchain = {m: self._onchain_positions[m]
-                       for m in (mkt_A, mkt_B) if m in self._onchain_positions}
-            details = ", ".join(
-                f"[{m}] {p['side']} {p['size']:.4f}" for m, p in onchain.items())
-            logger.info("[%s] Skip: on-chain position exists (%s)", pair_name, details)
-            events.append({
-                "type": "skip",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
-                "spread": round(max_spread, 6),
-                "reason": "onchain_position_exists",
-            })
-            return events
-
-        # Margin pre-check: skip pair early if insufficient collateral
-        spot_price = context.data.get_spot_price(mkt_A) or 1.0
-        rate_for_margin_A = bid_A if best_scenario == 1 else ask_A
-        rate_for_margin_B = ask_B if best_scenario == 1 else bid_B
-        has_margin, margin_max_tokens = self._check_margin(
-            context, mkt_A, mkt_B,
-            rate_for_margin_A, rate_for_margin_B, spot_price)
-
-        if not has_margin:
-            events.append({
-                "type": "skip",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
-                "spread": round(max_spread, 6),
-                "reason": "insufficient_margin",
-            })
-            return events
-
-        # Use cached orderbooks
+        # Compute VWAP entry APRs
         book_A = self._get_orderbook(context, mkt_A)
         book_B = self._get_orderbook(context, mkt_B)
 
         if best_scenario == 1:
-            liquidity_A = book_A.get('bids', [])   # We sell to bids
-            liquidity_B = book_B.get('asks', [])   # We buy from asks
-        else:
-            liquidity_A = book_A.get('asks', [])   # We buy from asks
-            liquidity_B = book_B.get('bids', [])   # We sell to bids
-
-        # Capital constraint: position value = Rate × TTR × Spot per token
-        max_yield_price = (max(bid_A, ask_B) if best_scenario == 1
-                           else max(bid_B, ask_A))
-        if max_yield_price <= 0:
-            max_yield_price = 0.01
-        info_cap = context.data.get_market_info(mkt_A)
-        maturity_ts = int(info_cap.get('imData', {}).get('maturity', 0))
-        now_ts = time.time()
-        time_remaining_years = max(0.0, (maturity_ts - now_ts) / 31_536_000)
-        token_position_value = abs(max_yield_price) * time_remaining_years * spot_price
-        if token_position_value <= 0:
-            token_position_value = 0.01
-        max_allowed_tokens = ((config.MAX_CAPITAL / 2.0) / token_position_value
-                              if token_position_value > 0 else float('inf'))
-        # Also cap by available margin
-        max_allowed_tokens = min(max_allowed_tokens, margin_max_tokens)
-
-        step = config.CAPACITY_STEP_TOKENS
-        test_tokens = 0.0
-        max_safe_tokens = 0.0
-
-        while True:
-            next_test = min(test_tokens + step, max_allowed_tokens)
-            if next_test <= test_tokens:
-                break
-            test_tokens = next_test
-
-            # VWAP for side A
-            vwap_A = self._calculate_vwap(liquidity_A, test_tokens)
-            if vwap_A is None:
-                break
-
-            # VWAP for side B
-            vwap_B = self._calculate_vwap(liquidity_B, test_tokens)
-            if vwap_B is None:
-                break
-
-            test_spread = (vwap_A - vwap_B if best_scenario == 1
-                           else vwap_B - vwap_A)
-
-            if test_spread < config.ENTRY_SPREAD_THRESHOLD:
-                break
-            max_safe_tokens = test_tokens
-
-            if test_tokens >= max_allowed_tokens:
-                break
-
-        # Apply liquidity factor only when book depth is the binding constraint
-        # (not when capital or margin cap stopped the walk first)
-        liquidity_constrained = max_safe_tokens < max_allowed_tokens
-        if liquidity_constrained:
-            tokens = max_safe_tokens * config.LIQUIDITY_FACTOR
-        else:
-            tokens = max_safe_tokens
-
-        # Minimum entry check (USD position value)
-        estimated_usd = tokens * token_position_value
-        if tokens < 0.01 or estimated_usd < config.MIN_ENTRY_USD:
-            events.append({
-                "type": "skip",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
-                "spread": round(max_spread, 6),
-                "reason": "insufficient_capacity",
-            })
-            return events
-        logger.info("[%s] ENTRY Scenario %d (Spread=%.2f%%, Tokens=%.1f)",
-                    pair_name, best_scenario, max_spread * 100, tokens)
-
-        if best_scenario == 1:
-            # Short A (1), Long B (0)
             side_A, side_B = 1, 0
+            entry_apr_A = _calc_vwap(book_A.get('bids', []), tokens) or bid_A
+            entry_apr_B = _calc_vwap(book_B.get('asks', []), tokens) or ask_B
             size_usd_A = tokens * bid_A
             size_usd_B = tokens * ask_B
         else:
-            # Short B (1), Long A (0)
             side_A, side_B = 0, 1
+            entry_apr_A = _calc_vwap(book_A.get('asks', []), tokens) or ask_A
+            entry_apr_B = _calc_vwap(book_B.get('bids', []), tokens) or bid_B
             size_usd_A = tokens * ask_A
             size_usd_B = tokens * bid_B
 
@@ -693,7 +895,12 @@ class FRArbitrageStrategy(BaseStrategy):
 
         round_id = f"{pair_name}_{context.now.isoformat()}"
 
-        # Atomic dual-market entry: both legs succeed or both fail
+        action = "SCALE-IN" if is_scalein else "ENTRY"
+        logger.info("[%s] %s Scenario %d (Spread=%.2f%%, Tokens=%.1f)",
+                    pair_name, action, best_scenario,
+                    cand['max_spread'] * 100, tokens)
+
+        # Atomic dual-market entry
         success = context.executor.submit_dual_order(
             mkt_a=mkt_A, side_a=side_A,
             mkt_b=mkt_B, side_b=side_B,
@@ -703,68 +910,82 @@ class FRArbitrageStrategy(BaseStrategy):
         )
 
         if success:
-            tokens_wei = str(int(tokens * 1e18))
-            context.state.set_position(self.name, mkt_A, {
-                "entry_time": context.now.isoformat(),
-                "side": side_A,
-                "position_size": size_usd_A,
-                "entry_rate": rate_for_margin_A,
-                "tokens": tokens,
-                "tokens_wei": tokens_wei,
+            new_layer = {
                 "round_id": round_id,
+                "tokens": tokens,
+                "position_size_A": size_usd_A,
+                "position_size_B": size_usd_B,
+                "entry_time": context.now.isoformat(),
+                "entry_apr_A": entry_apr_A,
+                "entry_apr_B": entry_apr_B,
+            }
+
+            if layers is None:
+                all_layers = [new_layer]
+            else:
+                all_layers = layers + [new_layer]
+
+            total_tokens = sum(l['tokens'] for l in all_layers)
+            total_size_A = sum(l.get('position_size_A', 0) for l in all_layers)
+            total_size_B = sum(l.get('position_size_B', 0) for l in all_layers)
+            first_entry = all_layers[0]['entry_time']
+
+            # Weighted average entry APR across layers
+            w_apr_A = sum(l['tokens'] * l.get('entry_apr_A', 0) for l in all_layers) / total_tokens
+            w_apr_B = sum(l['tokens'] * l.get('entry_apr_B', 0) for l in all_layers) / total_tokens
+
+            tokens_wei = str(int(total_tokens * 1e18))
+
+            context.state.set_position(self.name, mkt_A, {
+                "entry_time": first_entry,
+                "side": side_A,
+                "position_size": total_size_A,
+                "entry_rate": w_apr_A,
+                "tokens": total_tokens,
+                "tokens_wei": tokens_wei,
+                "round_id": all_layers[0]['round_id'],
+                "last_addon_time": context.now.isoformat(),
+                "weighted_entry_apr": w_apr_A,
+                "layers": all_layers,
             })
             context.state.set_position(self.name, mkt_B, {
-                "entry_time": context.now.isoformat(),
+                "entry_time": first_entry,
                 "side": side_B,
-                "position_size": size_usd_B,
-                "entry_rate": rate_for_margin_B,
-                "tokens": tokens,
+                "position_size": total_size_B,
+                "entry_rate": w_apr_B,
+                "tokens": total_tokens,
                 "tokens_wei": tokens_wei,
-                "round_id": round_id,
+                "round_id": all_layers[0]['round_id'],
+                "last_addon_time": context.now.isoformat(),
+                "weighted_entry_apr": w_apr_B,
+                "layers": all_layers,
             })
 
-            # Deduct estimated IM from collateral cache so subsequent
-            # entries in the same tick see reduced available balance.
-            self._deduct_im_from_cache(context, mkt_A, mkt_B,
-                                       rate_for_margin_A, rate_for_margin_B, tokens)
+            # Deduct IM from cache
+            rate_A = bid_A if best_scenario == 1 else ask_A
+            rate_B = ask_B if best_scenario == 1 else bid_B
+            self._deduct_im_from_cache(context, mkt_A, mkt_B, rate_A, rate_B, tokens)
 
             events.append({
-                "type": "entry",
-                "pair": pair_name,
-                "market_id_a": mkt_A,
-                "market_id_b": mkt_B,
+                "type": "entry", "pair": pair_name,
+                "market_id_a": mkt_A, "market_id_b": mkt_B,
                 "scenario": best_scenario,
-                "spread": round(max_spread, 6),
+                "spread": round(cand['max_spread'], 6),
                 "tokens": round(tokens, 4),
                 "size_usd_a": round(size_usd_A, 2),
                 "size_usd_b": round(size_usd_B, 2),
                 "round_id": round_id,
+                "is_scalein": is_scalein,
+                "layer_count": len(all_layers),
             })
         else:
-            # Atomic: both legs rejected together, no partial fill risk
-            logger.error("[%s] Dual entry failed (atomic)", pair_name)
+            logger.error("[%s] Dual %s failed (atomic)", pair_name, action.lower())
             events.append({
-                "type": "exec_fail",
-                "pair": pair_name,
+                "type": "exec_fail", "pair": pair_name,
                 "market_id_a": mkt_A, "market_id_b": mkt_B,
-                "reason": "dual_entry_failed",
-                "spread": round(max_spread, 6),
+                "reason": f"dual_{action.lower()}_failed",
+                "spread": round(cand['max_spread'], 6),
                 "tokens": round(tokens, 4),
             })
 
         return events
-
-    @staticmethod
-    def _calculate_vwap(liquidity: list, target_tokens: float):
-        """Walk orderbook levels to calculate VWAP for target_tokens. Returns None if book exhausted."""
-        remaining = target_tokens
-        total_usd = 0.0
-        for px, sz in liquidity:
-            take = min(remaining, sz)
-            total_usd += take * px
-            remaining -= take
-            if remaining <= 1e-6:
-                break
-        if remaining > 1e-6:
-            return None
-        return total_usd / target_tokens if target_tokens > 0 else 0

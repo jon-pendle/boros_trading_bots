@@ -14,6 +14,7 @@ IFTTT setup:
   2. Set env: IFTTT_WEBHOOK_KEY=your_key
 """
 import logging
+import os
 import time
 import requests
 
@@ -55,11 +56,17 @@ class IFTTTAlert:
         return False
 
 
+def _tag(env: str, priority: str) -> str:
+    """Build IFTTT JSON key like 'Prod[P1]' or 'Test[P3]'."""
+    return f"{env}[{priority}]"
+
+
 class AlertHandler:
     """Processes strategy events and dispatches alerts by priority tier."""
 
     def __init__(self, ifttt: IFTTTAlert):
         self.ifttt = ifttt
+        self._env = os.environ.get("BOT_ENV", "dev").capitalize()
         # exec_fail throttle: {pair -> last_alert_timestamp}
         self._exec_fail_last: dict[str, float] = {}
         # P2 skip accumulator: collected between summary cycles
@@ -87,75 +94,40 @@ class AlertHandler:
                 self._pending_skips.append(event)
 
     # ------------------------------------------------------------------
-    # P3 — periodic summary (1 consolidated IFTTT message)
+    # P3 — periodic summary
     # ------------------------------------------------------------------
 
     def send_summary_alerts(self, summary: dict):
-        """Send periodic summary as a single consolidated IFTTT message."""
-        lines = []
-
-        # 1. Heartbeat
-        lines.append(
-            f"T#{summary['tick']} "
-            f"Up:{summary['uptime_hours']:.1f}h "
-            f"AvgTick:{summary['avg_tick_seconds']:.0f}s "
-            f"Pairs:{summary.get('active_pairs', 0)} "
-            f"Fails:{summary['cb_failures']}"
-        )
-
-        # 2. PnL
+        """Send periodic summary as a single compact IFTTT message."""
         pnl = summary.get('pnl', {})
-        lines.append(
-            f"PnL u:${pnl.get('unrealized', 0):+.2f}"
-            f"({pnl.get('open_pairs', 0)}p) "
-            f"r:${pnl.get('realized', 0):+.2f}"
-            f"({pnl.get('closed_rounds', 0)}rd) "
-            f"= ${pnl.get('total', 0):+.2f}"
-        )
+        stats = summary.get('stats', {})
 
-        # 3. Collateral (compact)
+        # Collateral: only show non-zero
         collaterals = summary.get('collaterals', {})
-        if collaterals:
-            coll_parts = []
-            for name, info in collaterals.items():
-                n_pos = len(info.get('positions', []))
+        coll_parts = []
+        for name, info in collaterals.items():
+            net = info.get('net_balance', 0)
+            if net > 0:
                 mr = info.get('margin_ratio', 0)
                 mr_str = f" MR:{mr:.0%}" if mr > 0 else ""
-                coll_parts.append(
-                    f"{name}:{info['available']:.2f}/{info.get('net_balance', 0):.2f}"
-                    f" IM:{info.get('initial_margin', 0):.2f}{mr_str} {n_pos}pos"
-                )
-            lines.append("Coll " + " | ".join(coll_parts))
+                coll_parts.append(f"{name}:{info['available']:.2f}/{net:.2f}{mr_str}")
 
-        # 4. Top spreads (top 3)
+        # Top 3 spreads
         top_spreads = summary.get('top_spreads', [])
-        if top_spreads:
-            sp_parts = [f"{s['pair']}:{s['spread']:.2f}%" for s in top_spreads[:3]]
-            lines.append("Spread " + " | ".join(sp_parts))
+        sp_parts = [f"{s['pair']}:{s['spread']:.1f}%" for s in top_spreads[:3]]
 
-        # 5. Session stats
-        stats = summary.get('stats', {})
-        if stats:
-            skip_parts = [f"{c}x{r}" for r, c in stats.get('skips', {}).items()]
-            lines.append(
-                f"Stats E:{stats.get('entries', 0)} X:{stats.get('exits', 0)} "
-                f"Skip:{','.join(skip_parts) if skip_parts else '0'} "
-                f"MaxSp:{stats.get('max_spread', 0) * 100:.2f}%"
-            )
-
-        # 6. Accumulated P2 skips since last summary
-        if self._pending_skips:
-            # Group by (pair, reason)
-            skip_groups: dict[str, int] = {}
-            for s in self._pending_skips:
-                key = f"{s.get('pair', '?')}:{s.get('reason', '?')}"
-                skip_groups[key] = skip_groups.get(key, 0) + 1
-            skip_strs = [f"{k}x{v}" for k, v in skip_groups.items()]
-            lines.append(f"Skips {' '.join(skip_strs)}")
-            self._pending_skips.clear()
-
-        # Send as single message
-        self.ifttt.send({"msg": f"[P3] " + "\n".join(lines)})
+        self._pending_skips.clear()
+        self.ifttt.send({
+            _tag(self._env, "P3"): (
+                f"T#{summary['tick']} {summary['uptime_hours']:.0f}h "
+                f"P:{summary.get('active_pairs', 0)} "
+                f"PnL:${pnl.get('total', 0):+.0f}"
+                f"({pnl.get('open_pairs', 0)}o/{pnl.get('closed_rounds', 0)}c) "
+                f"{' | '.join(coll_parts) if coll_parts else 'NoColl'} "
+                f"{' | '.join(sp_parts)}"
+                f" Max:{stats.get('max_spread', 0) * 100:.1f}%"
+            ),
+        })
 
     # ------------------------------------------------------------------
     # P0 — critical
@@ -163,10 +135,9 @@ class AlertHandler:
 
     def _on_liquidation(self, e: dict):
         self.ifttt.send({
-            "msg": (
-                f"[P0] LIQUIDATED [{e.get('market_id', '?')}] | "
-                f"${e.get('position_size', 0)} | "
-                f"state cleared"
+            _tag(self._env, "P0"): (
+                f"LIQUIDATED [{e.get('market_id', '?')}] "
+                f"${e.get('position_size', 0)}"
             ),
         })
 
@@ -174,15 +145,14 @@ class AlertHandler:
         status = e.get('status', 'open')
         if status == 'open':
             self.ifttt.send({
-                "msg": (
-                    f"[P0] CB_OPEN | "
-                    f"{e.get('consecutive_failures', 0)} consecutive failures | "
+                _tag(self._env, "P0"): (
+                    f"CB_OPEN {e.get('consecutive_failures', 0)} fails "
                     f"cooldown {e.get('cooldown_seconds', 0)}s"
                 ),
             })
         else:
             self.ifttt.send({
-                "msg": f"[P0] CB_RECOVERED | resuming normal operation",
+                _tag(self._env, "P0"): "CB_RECOVERED",
             })
 
     # ------------------------------------------------------------------
@@ -191,21 +161,21 @@ class AlertHandler:
 
     def _on_entry(self, e: dict):
         self.ifttt.send({
-            "msg": (
-                f"[P1] ENTRY {e.get('pair', '?')} | "
-                f"S{e.get('scenario', '?')} spread={e.get('spread', 0):.2%} | "
-                f"{e.get('tokens', 0):.1f} tokens | "
+            _tag(self._env, "P1"): (
+                f"ENTRY {e.get('pair', '?')} "
+                f"sp={e.get('spread', 0):.1%} "
+                f"{e.get('tokens', 0):.1f}tk "
                 f"${e.get('size_usd_a', 0):.0f}+${e.get('size_usd_b', 0):.0f}"
             ),
         })
 
     def _on_exit(self, e: dict):
         self.ifttt.send({
-            "msg": (
-                f"[P1] EXIT {e.get('pair', '?')} | "
-                f"spread={e.get('current_spread', 0):.2%} | "
-                f"held {e.get('duration_hours', 0):.1f}h | "
-                f"{e.get('tokens_closed', 0):.1f} tokens | "
+            _tag(self._env, "P1"): (
+                f"EXIT {e.get('pair', '?')} "
+                f"sp={e.get('current_spread', 0):.1%} "
+                f"{e.get('duration_hours', 0):.1f}h "
+                f"{e.get('tokens_closed', 0):.1f}tk "
                 f"{e.get('reason', '')}"
             ),
         })
@@ -221,10 +191,10 @@ class AlertHandler:
             return
         self._exec_fail_last[pair] = now
         self.ifttt.send({
-            "msg": (
-                f"[P1] EXEC_FAIL {pair} | "
-                f"{e.get('reason', '?')} | "
-                f"spread={e.get('spread', 0):.2%} | "
-                f"{e.get('tokens', 0):.1f} tokens"
+            _tag(self._env, "P1"): (
+                f"FAIL {pair} "
+                f"{e.get('reason', '?')} "
+                f"sp={e.get('spread', 0):.1%} "
+                f"{e.get('tokens', 0):.1f}tk"
             ),
         })

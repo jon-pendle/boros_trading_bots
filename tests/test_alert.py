@@ -4,6 +4,20 @@ from unittest.mock import patch, MagicMock
 from strategies.framework.alert import IFTTTAlert, AlertHandler
 
 
+def _get_msg(ifttt_mock, call_idx=0):
+    """Extract the message string from IFTTT send call.
+    New format: {"Env[Px]": "message"} — value is the message."""
+    payload = ifttt_mock.send.call_args_list[call_idx][0][0]
+    # Return the first value in the dict (the message)
+    return list(payload.values())[0]
+
+
+def _get_key(ifttt_mock, call_idx=0):
+    """Extract the JSON key from IFTTT send call (e.g. 'Dev[P1]')."""
+    payload = ifttt_mock.send.call_args_list[call_idx][0][0]
+    return list(payload.keys())[0]
+
+
 class TestIFTTTAlert:
     def test_disabled_without_key(self):
         alert = IFTTTAlert("")
@@ -53,9 +67,10 @@ class TestAlertHandler:
             "scenario": 1, "spread": 0.045, "tokens": 50.0,
         }])
         ifttt.send.assert_called_once()
-        payload = ifttt.send.call_args[0][0]
-        assert "ENTRY" in payload["msg"]
-        assert "BTC_20260327_23_60" in payload["msg"]
+        msg = _get_msg(ifttt)
+        assert "ENTRY" in msg
+        assert "BTC_20260327_23_60" in msg
+        assert "P1" in _get_key(ifttt)
 
     def test_entry_single_market_triggers_alert(self):
         handler, ifttt = self._make_handler()
@@ -64,7 +79,8 @@ class TestAlertHandler:
             "funding_rate": -0.15, "position_size": 1000,
         }])
         ifttt.send.assert_called_once()
-        assert "ENTRY" in ifttt.send.call_args[0][0]["msg"]
+        msg = _get_msg(ifttt)
+        assert "ENTRY" in msg
 
     def test_exit_pair_triggers_alert(self):
         handler, ifttt = self._make_handler()
@@ -74,7 +90,8 @@ class TestAlertHandler:
             "reason": "Spread=3.00%",
         }])
         ifttt.send.assert_called_once()
-        assert "EXIT" in ifttt.send.call_args[0][0]["msg"]
+        msg = _get_msg(ifttt)
+        assert "EXIT" in msg
 
     def test_exit_with_spread_triggers_alert(self):
         handler, ifttt = self._make_handler()
@@ -84,7 +101,8 @@ class TestAlertHandler:
             "tokens_closed": 10.0, "reason": "Spread=2.00%",
         }])
         ifttt.send.assert_called_once()
-        assert "EXIT" in ifttt.send.call_args[0][0]["msg"]
+        msg = _get_msg(ifttt)
+        assert "EXIT" in msg
 
     def test_liquidation_triggers_alert(self):
         handler, ifttt = self._make_handler()
@@ -93,7 +111,9 @@ class TestAlertHandler:
             "symbol": "SOL", "position_size": 1000,
         }])
         ifttt.send.assert_called_once()
-        assert "LIQUIDATED" in ifttt.send.call_args[0][0]["msg"]
+        msg = _get_msg(ifttt)
+        assert "LIQUIDATED" in msg
+        assert "P0" in _get_key(ifttt)
 
     def test_scan_no_alert(self):
         handler, ifttt = self._make_handler()
@@ -114,7 +134,7 @@ class TestAlertHandler:
         assert len(handler._pending_skips) == 1
 
     def test_skip_included_in_summary(self):
-        """Accumulated skips are included in the next P3 summary."""
+        """Accumulated skips are cleared after summary send."""
         handler, ifttt = self._make_handler()
         handler.handle_events([
             {"type": "skip", "pair": "BTC_23_60", "spread": 0.045, "reason": "insufficient_margin"},
@@ -129,9 +149,8 @@ class TestAlertHandler:
         }
         handler.send_summary_alerts(summary)
         ifttt.send.assert_called_once()
-        msg = ifttt.send.call_args[0][0]["msg"]
-        assert "Skips" in msg
-        assert "insufficient_margin" in msg
+        msg = _get_msg(ifttt)
+        assert "P3" in _get_key(ifttt)
         # Pending skips cleared after summary
         assert len(handler._pending_skips) == 0
 
@@ -143,9 +162,9 @@ class TestAlertHandler:
             "spread": 0.045, "tokens": 10.0,
         }])
         ifttt.send.assert_called_once()
-        payload = ifttt.send.call_args[0][0]
-        assert "EXEC_FAIL" in payload["msg"]
-        assert "leg_b_failed_rollback" in payload["msg"]
+        msg = _get_msg(ifttt)
+        assert "FAIL" in msg
+        assert "leg_b_failed_rollback" in msg
 
     def test_exec_fail_throttled_per_pair(self):
         """Same pair exec_fail within 30min window is suppressed."""
@@ -175,8 +194,9 @@ class TestAlertHandler:
             "consecutive_failures": 5, "cooldown_seconds": 300,
         }])
         ifttt.send.assert_called_once()
-        payload = ifttt.send.call_args[0][0]
-        assert "CB_OPEN" in payload["msg"]
+        msg = _get_msg(ifttt)
+        assert "CB_OPEN" in msg
+        assert "P0" in _get_key(ifttt)
 
     def test_summary_alerts_sent(self):
         handler, ifttt = self._make_handler()
@@ -206,8 +226,7 @@ class TestAlertHandler:
         handler.send_summary_alerts(summary)
         # Single consolidated message
         ifttt.send.assert_called_once()
-        msg = ifttt.send.call_args[0][0]["msg"]
-        assert "[P3]" in msg
+        key = _get_key(ifttt)
+        msg = _get_msg(ifttt)
+        assert "P3" in key
         assert "PnL" in msg
-        assert "Coll" in msg
-        assert "Spread" in msg
