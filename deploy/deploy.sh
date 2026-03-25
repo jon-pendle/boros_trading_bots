@@ -10,7 +10,7 @@ REMOTE_DIR="~/boros_trade_bot"
 
 echo "=== Deploying boros_trade_bot ($TARGET) to $REMOTE ==="
 
-# Sync code (excludes secrets and local state)
+# Sync code (excludes secrets, local state, and pause files)
 rsync -avz --delete \
     --exclude='.env*' \
     --exclude='*.json' \
@@ -19,6 +19,7 @@ rsync -avz --delete \
     --exclude='.git/' \
     --exclude='.claude/' \
     --exclude='tests/' \
+    --exclude='.pause_*' \
     -e ssh \
     /root/boros_trade_bot/ \
     "$REMOTE:$REMOTE_DIR/"
@@ -39,10 +40,12 @@ case "$TARGET" in
         ;;
 esac
 
-# Install cron monitor (idempotent)
+# Install cron monitor for both containers (idempotent)
 ssh "$REMOTE" "
-    CRON_CMD='*/5 * * * * $REMOTE_DIR/deploy/check_bot.sh'
-    (crontab -l 2>/dev/null | grep -v check_bot.sh; echo \"\$CRON_CMD\") | crontab -
+    (crontab -l 2>/dev/null | grep -v check_bot.sh
+     echo '*/5 * * * * $REMOTE_DIR/deploy/check_bot.sh boros-prod'
+     echo '*/5 * * * * $REMOTE_DIR/deploy/check_bot.sh boros-test'
+    ) | crontab -
     echo 'Cron installed:'
     crontab -l | grep check_bot
 "

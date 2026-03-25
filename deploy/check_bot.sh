@@ -4,11 +4,11 @@
 # Sends IFTTT alert if bot is down, auto-restarts container
 
 BOT_DIR="$HOME/boros_trade_bot"
-CONTAINER="boros-prod"
-PAUSE_FILE="$BOT_DIR/.pause_monitor"
+CONTAINER="${1:-boros-prod}"
 MAX_AGE=300  # 5 minutes
 
-# Maintenance mode: skip all checks when pause file exists
+# Per-container maintenance mode: .pause_prod or .pause_test
+PAUSE_FILE="$BOT_DIR/.pause_${CONTAINER#boros-}"
 if [ -f "$PAUSE_FILE" ]; then
     exit 0
 fi
