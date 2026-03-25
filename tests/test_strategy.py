@@ -3,7 +3,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from strategies.fr_arb.strategy import (
-    FRArbitrageStrategy, _calc_vwap, _get_topn_avail,
+    FRArbitrageStrategy, _calc_vwap,
 )
 from strategies.fr_arb import config as fr_config
 from strategies.framework.interfaces import IContext, IExecutor
@@ -496,24 +496,19 @@ class TestMarginalPnlTokens:
 # Top-3 floor + scan logic in exit
 # ======================================================================
 
-class TestExitDepthFloor:
+class TestExitMarginalScanOnly:
     @patch.object(fr_config, "EXIT_SPREAD_THRESHOLD", 0.038)
     @patch.object(fr_config, "MIN_HOLD_HOURS", 1.0)
     @patch.object(fr_config, "ENTRY_SPREAD_THRESHOLD", 0.10)
-    def test_top3_is_floor(self):
-        """Exit close tokens = max(top3, scan). Top3 provides a floor."""
+    def test_no_exit_when_exec_spread_too_wide(self):
+        """OB execution spread exceeds threshold -> marginal scan=0 -> no exit."""
         ctx = make_context()
-        # Narrow spread for exit trigger
-        # Top-3 levels have 30 tokens each = 90 total per side
-        # But scan might give less if marginal spread is bad deeper in book
-        ob_a = {
-            "bids": [(0.055, 10.0)],
-            "asks": [(0.06, 10.0), (0.065, 10.0), (0.07, 10.0)],
-        }
-        ob_b = {
-            "bids": [(0.03, 10.0), (0.025, 10.0), (0.02, 10.0)],
-            "asks": [(0.035, 10.0)],
-        }
+        # Mid spread narrow (triggers exit signal):
+        # mid_A=(0.035+0.08)/2=0.0575, mid_B=(0.03+0.038)/2=0.034
+        # spread=0.0235 < 0.038 ✓
+        # But exec spread: ask_A=0.08, bid_B=0.03 → 0.05 > EXIT_SPREAD_THRESHOLD
+        ob_a = {"bids": [(0.035, 500.0)], "asks": [(0.08, 500.0)]}
+        ob_b = {"bids": [(0.03, 500.0)], "asks": [(0.038, 500.0)]}
         setup_pair(ctx, ob_a=ob_a, ob_b=ob_b)
 
         entry_time = ctx.now - timedelta(hours=5)
@@ -539,9 +534,7 @@ class TestExitDepthFloor:
         events = strat.on_tick(ctx)
 
         exits = [e for e in events if e["type"] == "exit"]
-        # Should attempt exit — exact tokens depend on depth
-        if exits:
-            assert exits[0]["tokens_closed"] > 0
+        assert len(exits) == 0  # marginal scan=0 → no exit → no neg PnL
 
 
 # ======================================================================

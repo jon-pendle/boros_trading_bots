@@ -38,19 +38,6 @@ def _calc_vwap(liq, tokens):
     return None
 
 
-def _get_topn_avail(liq, n_levels):
-    """Sum available tokens in top-N distinct price levels."""
-    if not liq or n_levels <= 0:
-        return 0.0
-    seen_levels = set()
-    total = 0.0
-    for px, sz in liq:
-        if len(seen_levels) >= n_levels and px not in seen_levels:
-            break
-        seen_levels.add(px)
-        total += sz
-    return total
-
 
 class FRArbitrageStrategy(BaseStrategy):
     def __init__(self):
@@ -727,16 +714,14 @@ class FRArbitrageStrategy(BaseStrategy):
         else:
             current_spread = mid_B - mid_A
 
-        force_close = duration_hours >= config.MAX_HOLD_HOURS
+        # No force close — positions settle at maturity.
         is_exit_signal = (
             current_spread < config.EXIT_SPREAD_THRESHOLD
             and duration_hours >= config.MIN_HOLD_HOURS
         )
 
         should_close = False
-        if force_close:
-            should_close = True
-        elif is_exit_signal:
+        if is_exit_signal:
             # Exit batching: only attempt every EXIT_BATCH_MINUTES
             last_close = pos_A.get('last_exit_batch_time')
             if last_close is None:
@@ -771,27 +756,14 @@ class FRArbitrageStrategy(BaseStrategy):
 
         total_tokens = pos_A['tokens']
 
-        if force_close:
-            avail_A = sum(sz for _, sz in exit_liq_A)
-            avail_B = sum(sz for _, sz in exit_liq_B)
-            safe_close_tokens = min(total_tokens, avail_A, avail_B)
-        else:
-            # Top-3 floor (proven baseline)
-            top3_A = _get_topn_avail(exit_liq_A, 3)
-            top3_B = _get_topn_avail(exit_liq_B, 3)
-            top3_tokens = min(total_tokens, top3_A, top3_B)
-
-            # Marginal execution spread scan
-            scan_tokens = self._marginal_pnl_tokens(
-                exit_liq_A, exit_liq_B, side_A, total_tokens)
-
-            # Top3 is floor, scan can only extend
-            safe_close_tokens = max(top3_tokens, scan_tokens)
+        # Marginal scan only — every closed token guaranteed: execution spread < threshold.
+        safe_close_tokens = self._marginal_pnl_tokens(
+            exit_liq_A, exit_liq_B, side_A, total_tokens)
 
         if safe_close_tokens < 0.1:
             return events
 
-        reason = "FORCE (Max Time)" if force_close else f"Spread={current_spread:.2%}"
+        reason = f"Spread={current_spread:.2%}"
         logger.info("[%s] EXIT %s, Closing=%.1f/%.1f Tokens",
                     pair_name, reason, safe_close_tokens, total_tokens)
 
