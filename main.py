@@ -19,7 +19,58 @@ from strategies.framework.alert import AlertHandler, IFTTTAlert
 from strategies.framework.context import LiveContext, ProdContext
 from strategies.framework.runner import StrategyRunner
 from strategies.fr_arb import FRArbitrageStrategy
+from strategies.zscore import ZScoreStrategy
 import strategies.fr_arb.config as fr_arb_config
+import strategies.zscore.config as zscore_config
+
+# Strategy registry: name -> (class, config_module)
+STRATEGIES = {
+    "fr_arb": (FRArbitrageStrategy, fr_arb_config),
+    "zscore": (ZScoreStrategy, zscore_config),
+}
+
+
+AGENT_EXPIRY_WARN_DAYS = 7  # warn if expiry within this many days
+
+
+def _check_agent_expiry(agent_address: str, user_address: str):
+    """Check agent approval expiry via Boros API. Warn or exit if expired/expiring."""
+    import time
+    import requests
+    logger = logging.getLogger(__name__)
+    try:
+        resp = requests.get(
+            "https://api.boros.finance/open-api/v1/agents/expiry-time",
+            params={
+                "userAddress": user_address,
+                "agentAddress": agent_address,
+                "accountId": 0,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("Agent expiry check failed: HTTP %d", resp.status_code)
+            return
+
+        expiry_ts = resp.json().get("expiryTime", 0)
+        now = int(time.time())
+        remaining_h = (expiry_ts - now) / 3600
+
+        if expiry_ts == 0:
+            logger.error("Agent NOT approved (expiryTime=0). Run approve_agent.py first.")
+            sys.exit(1)
+        elif expiry_ts <= now:
+            logger.error("Agent EXPIRED %.0fh ago (expiry=%d). Run approve_agent.py to renew.",
+                         -remaining_h, expiry_ts)
+            sys.exit(1)
+        elif remaining_h < AGENT_EXPIRY_WARN_DAYS * 24:
+            logger.warning("Agent expires in %.1fh (%.1f days). Renew soon!",
+                           remaining_h, remaining_h / 24)
+        else:
+            logger.info("Agent approved, expires in %.0f days", remaining_h / 24)
+    except Exception as e:
+        logger.error("Agent expiry check failed: %s", e)
+        sys.exit(1)
 
 
 def setup_logging():
@@ -41,36 +92,49 @@ def main():
     parser.add_argument("--interval", type=int, default=fr_arb_config.TICK_INTERVAL_SECONDS,
                         help="Tick interval in seconds")
     parser.add_argument("--state-file", default=fr_arb_config.STATE_FILE, help="State persistence file (sim only)")
+    parser.add_argument("--strategy", default=os.environ.get("STRATEGY", "fr_arb"),
+                        choices=list(STRATEGIES.keys()),
+                        help="Strategy to run (default: fr_arb, env: STRATEGY)")
     args = parser.parse_args()
 
     dry_run = not args.live
     mode = "DRY-RUN" if dry_run else "LIVE"
     bot_env = os.environ.get("BOT_ENV", "dev")
+    strat_name = args.strategy
+
+    StrategyClass, strat_config = STRATEGIES[strat_name]
 
     sep = "=" * 60
     logger.info(sep)
     logger.info("Boros Trade Bot [%s] env=%s", mode, bot_env)
     logger.info(sep)
-    logger.info("Strategy:        FR Arbitrage")
+    logger.info("Strategy:        %s", strat_name)
     logger.info("API:             %s", args.api_url)
     logger.info("Interval:        %ds", args.interval)
     logger.info("User:            %s", fr_arb_config.USER_ADDRESS or "(none)")
     logger.info("--- Strategy Params ---")
-    logger.info("Entry Spread:    %.2f%%", fr_arb_config.ENTRY_SPREAD_THRESHOLD * 100)
-    logger.info("Exit Spread:     %.2f%%", fr_arb_config.EXIT_SPREAD_THRESHOLD * 100)
-    logger.info("Min Hold:        %.1fh", fr_arb_config.MIN_HOLD_HOURS)
-    logger.info("Max Hold:        %s", "inf" if fr_arb_config.MAX_HOLD_HOURS == float('inf') else f"{fr_arb_config.MAX_HOLD_HOURS:.1f}h")
-    logger.info("Max Capital:     $%.0f per pair", fr_arb_config.MAX_CAPITAL)
-    logger.info("Min Entry USD:   $%.0f", fr_arb_config.MIN_ENTRY_USD)
-    logger.info("Capacity Step:   %.1f tokens", fr_arb_config.CAPACITY_STEP_TOKENS)
-    logger.info("Liquidity Factor:%.2f", fr_arb_config.LIQUIDITY_FACTOR)
-    logger.info("Allowed Tokens:  %s", fr_arb_config.ALLOWED_TOKEN_IDS or "all")
+
+    if strat_name == "fr_arb":
+        logger.info("Entry Spread:    %.2f%%", fr_arb_config.ENTRY_SPREAD_THRESHOLD * 100)
+        logger.info("Exit Spread:     %.2f%%", fr_arb_config.EXIT_SPREAD_THRESHOLD * 100)
+        logger.info("Max Capital:     $%.0f (global)", fr_arb_config.MAX_CAPITAL)
+    elif strat_name == "zscore":
+        logger.info("Lookback:        %d ticks (~%.1f days)", zscore_config.LOOKBACK, zscore_config.LOOKBACK / 96)
+        logger.info("K Entry:         %.1f sigma", zscore_config.K_ENTRY)
+        logger.info("K Exit:          %.1f sigma", zscore_config.K_EXIT)
+        logger.info("Use MAD:         %s", zscore_config.USE_MAD)
+        logger.info("Max Capital:     $%.0f (global)", zscore_config.MAX_CAPITAL)
+
+    logger.info("Min Hold:        %.1fh", strat_config.MIN_HOLD_HOURS)
+    logger.info("Capacity Step:   %.1f tokens", strat_config.CAPACITY_STEP_TOKENS)
+    logger.info("Liquidity Factor:%.2f", strat_config.LIQUIDITY_FACTOR)
+    logger.info("Allowed Tokens:  %s", strat_config.ALLOWED_TOKEN_IDS or "all")
     logger.info("--- Alerts ---")
     logger.info("IFTTT:           %s", "enabled" if fr_arb_config.IFTTT_WEBHOOK_KEY else "disabled")
     logger.info("State File:      %s", args.state_file if dry_run else "API (entry_times.json)")
     logger.info(sep)
 
-    strategy = FRArbitrageStrategy()
+    strategy = StrategyClass()
 
     user_address = None
     if args.live:
@@ -85,6 +149,9 @@ def main():
             user_address=user_address,
             agent_private_key=agent_key,
         )
+
+        # Check agent approval expiry
+        _check_agent_expiry(context.executor.signer.agent_address, user_address)
     else:
         context = LiveContext(
             api_base_url=args.api_url,

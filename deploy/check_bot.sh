@@ -5,8 +5,15 @@
 
 BOT_DIR="$HOME/boros_trade_bot"
 CONTAINER="boros-prod"
-HEARTBEAT=$(docker exec $CONTAINER cat /app/logs/heartbeat.json 2>/dev/null)
+PAUSE_FILE="$BOT_DIR/.pause_monitor"
 MAX_AGE=300  # 5 minutes
+
+# Maintenance mode: skip all checks when pause file exists
+if [ -f "$PAUSE_FILE" ]; then
+    exit 0
+fi
+
+HEARTBEAT=$(docker exec $CONTAINER cat /app/logs/heartbeat.json 2>/dev/null)
 
 # Load IFTTT key from prod env
 IFTTT_KEY=$(grep IFTTT_WEBHOOK_KEY "$BOT_DIR/.env.prod" 2>/dev/null | cut -d= -f2)

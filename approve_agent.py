@@ -72,19 +72,20 @@ APPROVE_AGENT_ABI = [{
     "type": "function",
 }]
 
-WEEK_SECONDS = 7 * 24 * 3600
+YEAR_SECONDS = 365 * 24 * 3600
 
 
 def build_approve_message(root_address: str, agent_address: str,
-                          expiry_seconds: int = WEEK_SECONDS,
+                          expiry_seconds: int = YEAR_SECONDS,
                           account_id: int = 0) -> dict:
-    now = int(time.time())
+    now_s = int(time.time())
+    nonce = int(time.time() * 1000) * 1000  # millis * 1000 per Boros signing spec
     return {
         "root": Web3.to_checksum_address(root_address),
         "accountId": account_id,
         "agent": Web3.to_checksum_address(agent_address),
-        "expiry": now + expiry_seconds,
-        "nonce": now,
+        "expiry": now_s + expiry_seconds,
+        "nonce": nonce,
     }
 
 
@@ -145,38 +146,15 @@ def mode_direct(args):
 
 
 def mode_manual(args):
-    """Generate HTML signing page + wait for signature paste."""
+    """Generate EIP-712 message, wait for signature paste."""
     message = build_approve_message(
         root_address=args.root,
         agent_address=args.agent,
         expiry_seconds=args.expiry_days * 86400,
     )
 
-    typed_data = {
-        "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-            **APPROVE_AGENT_MESSAGE_TYPES,
-        },
-        "primaryType": "ApproveAgentMessage",
-        "domain": {
-            "name": EIP712_DOMAIN["name"],
-            "version": EIP712_DOMAIN["version"],
-            "chainId": ARBITRUM_CHAIN_ID,
-            "verifyingContract": ROUTER_ADDRESS,
-        },
-        "message": {
-            "root": message["root"],
-            "accountId": message["accountId"],
-            "agent": message["agent"],
-            "expiry": str(message["expiry"]),
-            "nonce": str(message["nonce"]),
-        },
-    }
+    typed_data = _build_eip712_typed_data(
+        APPROVE_AGENT_MESSAGE_TYPES, "ApproveAgentMessage", message)
 
     print(f"\n  Root:    {message['root']}")
     print(f"  Agent:   {message['agent']}")
@@ -196,18 +174,9 @@ def mode_manual(args):
     print(f"Done! {json.dumps(result, indent=2)}")
 
 
-def mode_qr(args):
-    """Generate BC-UR eth-sign-request QR for air-gapped wallets."""
-    from bc_ur import (generate_eth_sign_request_ur_multi,
-                       show_animated_ur_qr)
-
-    message = build_approve_message(
-        root_address=args.root,
-        agent_address=args.agent,
-        expiry_seconds=args.expiry_days * 86400,
-    )
-
-    typed_data = {
+def _build_eip712_typed_data(message_types: dict, primary_type: str,
+                              message: dict) -> dict:
+    return {
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
@@ -215,23 +184,30 @@ def mode_qr(args):
                 {"name": "chainId", "type": "uint256"},
                 {"name": "verifyingContract", "type": "address"},
             ],
-            **APPROVE_AGENT_MESSAGE_TYPES,
+            **message_types,
         },
-        "primaryType": "ApproveAgentMessage",
+        "primaryType": primary_type,
         "domain": {
             "name": EIP712_DOMAIN["name"],
             "version": EIP712_DOMAIN["version"],
             "chainId": ARBITRUM_CHAIN_ID,
             "verifyingContract": ROUTER_ADDRESS,
         },
-        "message": {
-            "root": message["root"],
-            "accountId": message["accountId"],
-            "agent": message["agent"],
-            "expiry": str(message["expiry"]),
-            "nonce": str(message["nonce"]),
-        },
+        "message": {k: str(v) if isinstance(v, int) else v for k, v in message.items()},
     }
+
+
+def mode_qr(args):
+    """Generate BC-UR eth-sign-request QR for air-gapped wallets."""
+    from bc_ur import generate_eth_sign_request_ur_multi, show_ur_qr
+
+    message = build_approve_message(
+        root_address=args.root,
+        agent_address=args.agent,
+        expiry_seconds=args.expiry_days * 86400,
+    )
+    typed_data = _build_eip712_typed_data(
+        APPROVE_AGENT_MESSAGE_TYPES, "ApproveAgentMessage", message)
 
     print(f"\n  Root:    {message['root']}")
     print(f"  Agent:   {message['agent']}")
@@ -240,9 +216,7 @@ def mode_qr(args):
     xfp = int(args.xfp, 16) if args.xfp else 0
     if not args.xfp:
         logger.warning("WARNING: --xfp not set. AirGap Vault needs master fingerprint to match wallet.")
-        logger.warning("Find it in AirGap Vault: Account Details > Extended Public Key info")
 
-    # Generate multi-part BC-UR QR (max 250 bytes per fragment)
     ur_parts = generate_eth_sign_request_ur_multi(
         typed_data=typed_data,
         signer_address=message["root"],
@@ -252,8 +226,7 @@ def mode_qr(args):
         max_fragment_len=250,
     )
 
-    from bc_ur import show_ur_qr
-    print(f"  Parts:   {len(ur_parts)} QR codes\n")
+    print(f"\n  APPROVE AGENT — {len(ur_parts)} QR code(s)\n")
     for i, part in enumerate(ur_parts):
         show_ur_qr(part, f"[{i+1}/{len(ur_parts)}]")
 
@@ -280,7 +253,7 @@ def mode_qr(args):
 def main():
     parser = argparse.ArgumentParser(description="Authorize Boros Agent")
     parser.add_argument("--agent", required=True, help="Agent address to authorize")
-    parser.add_argument("--expiry-days", type=int, default=7, help="Expiry in days (default: 7)")
+    parser.add_argument("--expiry-days", type=int, default=365, help="Expiry in days (default: 365)")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--root-key", help="Root wallet private key (direct mode)")

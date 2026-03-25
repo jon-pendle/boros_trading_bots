@@ -22,22 +22,23 @@ class InMemoryStateManager(IStateManager):
     def get_position(self, strategy_name: str, market_id: int) -> Optional[Dict[str, Any]]:
         return self._positions.get(f"{strategy_name}_{market_id}")
 
-    def get_all_positions(self, strategy_name: str) -> Dict[int, Dict[str, Any]]:
+    def get_all_positions(self, strategy_name: str) -> Dict:
         result = {}
         prefix = f"{strategy_name}_"
         for key, data in self._positions.items():
             if key.startswith(prefix):
+                suffix = key[len(prefix):]
                 try:
-                    market_id = int(key[len(prefix):])
-                    result[market_id] = data
+                    pos_key = int(suffix)
                 except ValueError:
-                    pass
+                    pos_key = suffix  # preserve string keys (pair names)
+                result[pos_key] = data
         return result
 
-    def set_position(self, strategy_name: str, market_id: int, data: Dict[str, Any]):
+    def set_position(self, strategy_name: str, market_id, data: Dict[str, Any]):
         self._positions[f"{strategy_name}_{market_id}"] = data
 
-    def clear_position(self, strategy_name: str, market_id: int):
+    def clear_position(self, strategy_name: str, market_id):
         key = f"{strategy_name}_{market_id}"
         self._positions.pop(key, None)
 
@@ -62,19 +63,20 @@ class JsonFileStateManager(IStateManager):
         with open(self.file_path, 'w') as f:
             json.dump(self._positions, f, indent=2)
 
-    def get_position(self, strategy_name: str, market_id: int) -> Optional[Dict[str, Any]]:
+    def get_position(self, strategy_name: str, market_id) -> Optional[Dict[str, Any]]:
         return self._positions.get(f"{strategy_name}_{market_id}")
 
-    def get_all_positions(self, strategy_name: str) -> Dict[int, Dict[str, Any]]:
+    def get_all_positions(self, strategy_name: str) -> Dict:
         result = {}
         prefix = f"{strategy_name}_"
         for key, data in self._positions.items():
             if key.startswith(prefix):
+                suffix = key[len(prefix):]
                 try:
-                    market_id = int(key[len(prefix):])
-                    result[market_id] = data
+                    pos_key = int(suffix)
                 except ValueError:
-                    pass
+                    pos_key = suffix
+                result[pos_key] = data
         return result
 
     def set_position(self, strategy_name: str, market_id: int, data: Dict[str, Any]):
