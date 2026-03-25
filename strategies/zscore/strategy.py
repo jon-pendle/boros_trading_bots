@@ -48,18 +48,47 @@ def _calc_vwap(liq, tokens):
     return None
 
 
-def _get_topn_avail(liq, n_levels):
-    """Sum available tokens in top-N distinct price levels."""
-    if not liq or n_levels <= 0:
-        return 0.0
-    seen_levels = set()
-    total = 0.0
-    for px, sz in liq:
-        if len(seen_levels) >= n_levels and px not in seen_levels:
+
+def _marginal_exit_tokens(exit_liq_A, exit_liq_B, side_A,
+                          total_tokens, exit_threshold):
+    """Marginal PnL scan: max tokens where marginal execution spread < threshold.
+    Each slice checks the incremental VWAP spread stays below the exit threshold."""
+    max_closeable = 0.0
+    prev_cum_A = 0.0
+    prev_cum_B = 0.0
+    step = max(1.0, total_tokens / 100.0)
+    test = 0.0
+
+    while test < total_tokens:
+        test = min(test + step, total_tokens)
+
+        vwap_A = _calc_vwap(exit_liq_A, test)
+        vwap_B = _calc_vwap(exit_liq_B, test)
+        if vwap_A is None or vwap_B is None:
             break
-        seen_levels.add(px)
-        total += sz
-    return total
+
+        cum_A = vwap_A * test
+        cum_B = vwap_B * test
+
+        slice_tokens = test - max_closeable
+        if slice_tokens < 0.01:
+            break
+        slice_apr_A = (cum_A - prev_cum_A) / slice_tokens
+        slice_apr_B = (cum_B - prev_cum_B) / slice_tokens
+
+        if side_A == 1:
+            marginal_spread = slice_apr_A - slice_apr_B
+        else:
+            marginal_spread = slice_apr_B - slice_apr_A
+
+        if marginal_spread >= exit_threshold:
+            break
+
+        max_closeable = test
+        prev_cum_A = cum_A
+        prev_cum_B = cum_B
+
+    return max_closeable
 
 
 class ZScoreStrategy(BaseStrategy):
@@ -75,6 +104,7 @@ class ZScoreStrategy(BaseStrategy):
         self._spread_history: dict[str, deque] = {}
         self._load_spread_history()
         self._positions_dirty = False  # track if positions changed this tick
+        self._orphan_last_warn: dict[int, float] = {}  # market_id -> last warning timestamp
 
     # ------------------------------------------------------------------
     # Spread history persistence
@@ -91,7 +121,7 @@ class ZScoreStrategy(BaseStrategy):
                 data = json.load(f)
             count = 0
             for pair_name, values in data.items():
-                self._spread_history[pair_name] = deque(values, maxlen=config.LOOKBACK)
+                self._spread_history[pair_name] = deque(values, maxlen=config.LOOKBACK * config.SAMPLE_INTERVAL)
                 count += len(values)
             logger.info("Loaded spread history: %d pairs, %d total observations",
                         len(data), count)
@@ -157,17 +187,28 @@ class ZScoreStrategy(BaseStrategy):
     # ------------------------------------------------------------------
 
     def _get_zscore(self, pair_name: str, spread: float):
-        """Compute MAD-based robust z-score for the pair's spread."""
+        """Compute MAD-based robust z-score for the pair's spread.
+        History stores every tick (1-min resolution). Z-score is computed
+        on downsampled history (every SAMPLE_INTERVAL-th value) to match
+        backtest 15-min granularity. Current spread is evaluated against
+        the downsampled distribution."""
+        maxlen = config.LOOKBACK * config.SAMPLE_INTERVAL
         if pair_name not in self._spread_history:
-            self._spread_history[pair_name] = deque(maxlen=config.LOOKBACK)
+            self._spread_history[pair_name] = deque(maxlen=maxlen)
         self._spread_history[pair_name].append(spread)
 
-        history = self._spread_history[pair_name]
+        # Downsample: take every SAMPLE_INTERVAL-th value from full history
+        full = self._spread_history[pair_name]
+        interval = config.SAMPLE_INTERVAL
+        sampled = [full[i] for i in range(len(full) - 1, -1, -interval)]
+        # sampled is newest-first; reverse for chronological order
+        sampled.reverse()
+
         min_obs = max(config.LOOKBACK // 2, 20)
-        if len(history) < min_obs:
+        if len(sampled) < min_obs:
             return None
 
-        arr = np.array(history)
+        arr = np.array(sampled)
 
         if config.USE_MAD:
             median = np.median(arr)
@@ -209,6 +250,17 @@ class ZScoreStrategy(BaseStrategy):
     def _market_claimed_by_pair(self, context: IContext, market_id: int) -> bool:
         """Check if any existing pair position references this market."""
         for _, pos in self._get_all_pair_positions(context).items():
+            if pos.get('mkt_A') == market_id or pos.get('mkt_B') == market_id:
+                return True
+        return False
+
+    def _market_occupied(self, context: IContext, market_id: int,
+                          exclude_pair: str = None) -> bool:
+        """Return True if any existing pair holds this market.
+        Matches backtest behavior: one market can only belong to one pair at a time."""
+        for pname, pos in self._get_all_pair_positions(context).items():
+            if pname == exclude_pair:
+                continue
             if pos.get('mkt_A') == market_id or pos.get('mkt_B') == market_id:
                 return True
         return False
@@ -421,6 +473,12 @@ class ZScoreStrategy(BaseStrategy):
             if vwap_B is None:
                 break
 
+            # VWAP spread must exceed entry threshold (matches backtest)
+            test_spread = (vwap_A - vwap_B if best_scenario == 1
+                           else vwap_B - vwap_A)
+            if test_spread < config.ENTRY_SPREAD_THRESHOLD:
+                break
+
             max_safe_tokens = test_tokens
             if test_tokens >= max_allowed_tokens:
                 break
@@ -528,26 +586,19 @@ class ZScoreStrategy(BaseStrategy):
 
             for mid, onchain in self._onchain_positions.items():
                 if mid not in claimed_markets and mid in targets:
-                    side_str = "SHORT" if onchain['side'] == 1 else "LONG"
-                    logger.warning("Orphan market [%d] %s %.4f tokens — auto-closing",
-                                   mid, side_str, onchain['size'])
-                    try:
-                        result = context.executor.close_position(
-                            market_id=mid, side=onchain['side'],
-                            tokens=onchain['size'],
-                            tokens_wei=onchain.get('size_wei', ''),
-                        )
-                        if result:
-                            events.append({
-                                "type": "exit", "pair": f"orphan_{mid}",
-                                "market_id_a": mid, "market_id_b": 0,
-                                "reason": "orphan_auto_close",
-                                "current_spread": 0,
-                                "duration_hours": 0,
-                                "tokens_closed": round(onchain['size'], 4),
-                            })
-                    except Exception as e:
-                        logger.warning("Orphan close [%d] failed: %s", mid, e)
+                    now_ts = time.time()
+                    last_warn = self._orphan_last_warn.get(mid, 0)
+                    if now_ts - last_warn >= 6 * 3600:  # throttle: 6 hours
+                        side_str = "SHORT" if onchain['side'] == 1 else "LONG"
+                        logger.warning("Orphan market [%d] %s %.4f tokens — NOT closing (manual review needed)",
+                                       mid, side_str, onchain['size'])
+                        events.append({
+                            "type": "skip", "pair": f"orphan_{mid}",
+                            "market_id_a": mid, "market_id_b": 0,
+                            "reason": "orphan_detected",
+                            "tokens": round(onchain['size'], 4),
+                        })
+                        self._orphan_last_warn[mid] = now_ts
 
         # ================================================================
         # Phase 2: ENTRY + SCALE-IN — z-score signal
@@ -609,6 +660,17 @@ class ZScoreStrategy(BaseStrategy):
                     })
                     continue
 
+                # Market exclusivity: one market can only belong to one pair
+                if (self._market_occupied(context, mkt_A) or
+                        self._market_occupied(context, mkt_B)):
+                    events.append({
+                        "type": "skip", "pair": pair_name,
+                        "market_id_a": mkt_A, "market_id_b": mkt_B,
+                        "z_score": round(z, 3),
+                        "reason": "market_occupied",
+                    })
+                    continue
+
                 # Margin pre-check
                 rate_A = bid_A if best_scenario == 1 else ask_A
                 rate_B = ask_B if best_scenario == 1 else bid_B
@@ -665,8 +727,22 @@ class ZScoreStrategy(BaseStrategy):
                 })
 
         # Process entries (most extreme z first)
+        if config.EXIT_ONLY:
+            entry_candidates.clear()
+            scalein_candidates.clear()
         entry_candidates.sort(key=lambda c: abs(c['z_score']), reverse=True)
         for cand in entry_candidates:
+            # Re-check market exclusivity (previous entry in this tick may have claimed it)
+            if (self._market_occupied(context, cand['mkt_A']) or
+                    self._market_occupied(context, cand['mkt_B'])):
+                events.append({
+                    "type": "skip", "pair": cand['pair_name'],
+                    "market_id_a": cand['mkt_A'], "market_id_b": cand['mkt_B'],
+                    "z_score": round(cand['z_score'], 3),
+                    "reason": "market_occupied",
+                })
+                continue
+
             total_allocated = self._get_total_allocated(context)
             remaining_capital = config.MAX_CAPITAL - total_allocated
             if remaining_capital <= 0:
@@ -788,10 +864,19 @@ class ZScoreStrategy(BaseStrategy):
             if a_on and b_on:
                 oc_A = self._onchain_positions[mkt_A]
                 oc_B = self._onchain_positions[mkt_B]
+
+                # Correct side from on-chain (source of truth)
+                if pos.get('side_A') != oc_A['side'] or pos.get('side_B') != oc_B['side']:
+                    logger.warning("  Pair [%s] side mismatch: state A=%s B=%s, chain A=%s B=%s — correcting",
+                                   pair_name, pos.get('side_A'), pos.get('side_B'),
+                                   oc_A['side'], oc_B['side'])
+                    pos['side_A'] = oc_A['side']
+                    pos['side_B'] = oc_B['side']
+                    self._positions_dirty = True
+
                 # Our pair's tokens can't exceed on-chain total
                 on_tokens = min(oc_A['size'], oc_B['size'])
                 if pos['tokens'] > on_tokens + 0.1:
-                    # Scaled down (partial liquidation)
                     scale = on_tokens / pos['tokens'] if pos['tokens'] > 0 else 0
                     pos['tokens'] = on_tokens
                     pos['position_size_A'] = pos.get('position_size_A', 0) * scale
@@ -803,11 +888,12 @@ class ZScoreStrategy(BaseStrategy):
                                 pair_name, on_tokens)
 
             elif not a_on or not b_on:
-                # One leg gone — pair is broken, clear it
+                # One leg gone — log warning but do NOT clear pair or close.
+                # Remaining leg settles at maturity; force close risks large loss.
                 gone = mkt_A if not a_on else mkt_B
-                logger.warning("Pair [%s] leg [%d] gone from chain, clearing pair",
-                               pair_name, gone)
-                self._clear_pair_pos(context, pair_name)
+                remaining = mkt_B if not a_on else mkt_A
+                logger.warning("Pair [%s] leg [%d] gone from chain, [%d] remains — holding for settlement",
+                               pair_name, gone, remaining)
 
         # Recover unknown on-chain positions as new pair records
         # (skip if already claimed by an existing pair)
@@ -882,20 +968,22 @@ class ZScoreStrategy(BaseStrategy):
         else:
             dir_z = None
 
-        force_close = duration_hours >= config.MAX_HOLD_HOURS
-        # z=None timeout: force exit if z-score unavailable for too long
-        z_none_timeout = (z is None and duration_hours >= config.Z_NONE_EXIT_HOURS)
+        # Current directional spread (for absolute spread guard)
+        mid_A = (pd_['bid_A'] + pd_['ask_A']) / 2.0
+        mid_B = (pd_['bid_B'] + pd_['ask_B']) / 2.0
+        current_spread = (mid_A - mid_B) if side_A == 1 else (mid_B - mid_A)
 
+        # Exit only on confirmed signal — no force close.
+        # Positions settle naturally at maturity; force close risks large realized loss.
         is_exit_signal = (
             dir_z is not None
             and dir_z < config.K_EXIT
+            and current_spread < config.ENTRY_SPREAD_THRESHOLD
             and duration_hours >= config.MIN_HOLD_HOURS
         )
 
         should_close = False
-        if force_close or z_none_timeout:
-            should_close = True
-        elif is_exit_signal:
+        if is_exit_signal:
             last_close = pair_pos.get('last_exit_batch_time')
             if last_close is None:
                 should_close = True
@@ -917,7 +1005,7 @@ class ZScoreStrategy(BaseStrategy):
             })
             return events
 
-        # Determine exit depth
+        # Determine exit depth via marginal PnL scan + top-3 floor
         book_A = self._get_orderbook(context, mkt_A)
         book_B = self._get_orderbook(context, mkt_B)
 
@@ -930,24 +1018,16 @@ class ZScoreStrategy(BaseStrategy):
 
         total_tokens = pair_pos['tokens']
 
-        if force_close or z_none_timeout:
-            avail_A = sum(sz for _, sz in exit_liq_A)
-            avail_B = sum(sz for _, sz in exit_liq_B)
-        else:
-            avail_A = _get_topn_avail(exit_liq_A, 3)
-            avail_B = _get_topn_avail(exit_liq_B, 3)
-
-        safe_close_tokens = min(total_tokens, avail_A, avail_B)
+        # Marginal PnL scan only — no top-3 floor override.
+        # Every closed token is guaranteed: execution spread < entry threshold.
+        safe_close_tokens = _marginal_exit_tokens(
+            exit_liq_A, exit_liq_B, side_A, total_tokens,
+            config.ENTRY_SPREAD_THRESHOLD)
 
         if safe_close_tokens < 0.1:
             return events
 
-        if z_none_timeout:
-            reason = f"FORCE (z=None {duration_hours:.0f}h)"
-        elif force_close:
-            reason = "FORCE (Max Time)"
-        else:
-            reason = f"z={dir_z:.2f}<{config.K_EXIT}"
+        reason = f"z={dir_z:.2f}<{config.K_EXIT}"
 
         logger.info("[%s] EXIT %s, Closing=%.1f/%.1f Tokens",
                     pair_name, reason, safe_close_tokens, total_tokens)
